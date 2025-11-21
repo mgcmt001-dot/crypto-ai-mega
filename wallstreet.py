@@ -27,21 +27,30 @@ DEFAULT_PAIRS = [
 # 所有分析周期
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
-# 固定主周期用于：左侧主图 + 回测
+# 固定主周期用于：K线 & 回测
 MAIN_TIMEFRAME = "4h"
 
 # 多周期权重：越长周期权重越大
 TF_WEIGHTS = {
-    "15m": 0.1,   # 短线噪音多
+    "15m": 0.1,
     "1h": 0.2,
-    "4h": 0.3,    # 波段核心
-    "1d": 0.4     # 趋势中枢
+    "4h": 0.3,
+    "1d": 0.4
 }
 
-MAX_LIMIT = 1500            # 单次从 OKX 拉取的最大K线数量
-FEE_RATE = 0.0005           # 模拟交易手续费（单边 0.05%）
-MIN_BARS_FOR_FACTORS = 60   # 起码要有这么多K线才谈得上因子
-INIT_CAPITAL = 10000.0      # 回测用虚拟初始资金（不在页面展示）
+MAX_LIMIT = 1500
+FEE_RATE = 0.0005           # 手续费假设（单边 0.05%）
+MIN_BARS_FOR_FACTORS = 60   # 起码要有这么多K线才算有因子
+INIT_CAPITAL = 10000.0      # 回测虚拟初始资金（页面不展示）
+
+# 时间框架说明（卡片用）
+TF_DESC = {
+    "15m": "超短线",
+    "1h": "日内",
+    "4h": "波段",
+    "1d": "趋势"
+}
+
 
 # =========================
 # 工具函数：OKX 数据获取
@@ -49,11 +58,11 @@ INIT_CAPITAL = 10000.0      # 回测用虚拟初始资金（不在页面展示�
 
 def tf_to_okx_bar(tf: str) -> str:
     """将自定义周期转成 OKX bar 参数"""
-    if tf.endswith("m"):   # 分钟
+    if tf.endswith("m"):
         return tf
-    if tf.endswith("h"):   # 小时
+    if tf.endswith("h"):
         return tf[:-1] + "H"
-    if tf.endswith("d"):   # 日
+    if tf.endswith("d"):
         return tf[:-1] + "D"
     return tf
 
@@ -74,7 +83,7 @@ def estimate_bars(tf: str, days: int) -> int:
 
 
 @st.cache_data(ttl=180)
-def fetch_okx_klines(inst_id: str, tf: str, limit: int = 500) -> pd.DataFrame | None:
+def fetch_okx_klines(inst_id: str, tf: str, limit: int = 500):
     """
     从 OKX 公共 REST 接口拉取 K 线数据
     inst_id 例：BTC-USDT
@@ -223,33 +232,29 @@ def compute_factor_series(df: pd.DataFrame) -> pd.DataFrame:
     # 趋势因子：EMA斜率 + MACD + ADX
     trend_raw = np.zeros(len(df))
 
-    # EMA斜率
     trend_raw += np.tanh(fac["ema_slope"].fillna(0) * 50)
 
-    # MACD 动量（标准化）
     macd_std = fac["macd_hist"].rolling(50).std()
     macd_norm = fac["macd_hist"] / (macd_std + 1e-8)
     trend_raw += np.tanh(macd_norm.fillna(0))
 
-    # ADX 趋势强度
     adx_comp = (fac["adx"] - 20) / 25
     adx_comp[fac["adx"] < 20] = 0
     trend_raw += adx_comp.fillna(0)
 
     fac["trend_score"] = (trend_raw * 20).clip(-50, 50)
 
-    # 反转因子：RSI + Bollinger 位置
+    # 反转因子
     reversal_raw = np.zeros(len(df))
-    reversal_raw += (50 - fac["rsi"]) / 25.0              # RSI < 50 → 正分（偏多反转）
-    reversal_raw += (0.5 - fac["bb_position"]) * 2.0      # 接近下轨 → 正分
+    reversal_raw += (50 - fac["rsi"]) / 25.0
+    reversal_raw += (0.5 - fac["bb_position"]) * 2.0
     fac["reversal_score"] = (reversal_raw * 20).clip(-50, 50)
 
-    # 波动率因子：当前波动 vs 历史中位数
+    # 波动率因子
     base_vol = fac["volatility"].rolling(100).median()
     vol_ratio = fac["volatility"] / (base_vol + 1e-8)
     fac["volatility_score"] = ((vol_ratio - 1.0) * 30).clip(-50, 50)
 
-    # 综合评分：趋势 50% + 反转 30% + 波动率方向加权 20%
     comp = (
         0.5 * fac["trend_score"] +
         0.3 * fac["reversal_score"] +
@@ -339,8 +344,12 @@ def build_multi_tf_signals(
         return pd.DataFrame()
 
     df_tf = pd.DataFrame(rows).set_index("timeframe")
-    # 按固定顺序排序
     df_tf = df_tf.reindex([tf for tf in TIMEFRAMES if tf in df_tf.index])
+
+    # 关键修正点：把 None 转成 NaN，避免格式化时报 TypeError
+    df_tf["stop_loss"] = pd.to_numeric(df_tf["stop_loss"], errors="coerce")
+    df_tf["take_profit"] = pd.to_numeric(df_tf["take_profit"], errors="coerce")
+
     return df_tf
 
 
@@ -358,13 +367,6 @@ def backtest_on_dataframe(
     risk_frac: float,
     max_holding_bars: int = 40
 ):
-    """
-    在指定周期 df 上做回测：
-    - 依据 composite_score 触发开仓
-    - 按 ATR 设置止盈止损
-    - 使用下一根K线高低价判断止盈止损
-    - 单次最多一笔仓位
-    """
     fac = compute_factor_series(df)
     if fac is None or fac.empty:
         return None, None
@@ -445,7 +447,6 @@ def backtest_on_dataframe(
                     exit_price = position["tp"]
                     reason = "take_profit"
 
-            # 时间止盈
             if exit_price is None and (i + 1 - position["entry_idx"] >= max_holding_bars):
                 exit_price = float(nxt["close"])
                 reason = "time_exit"
@@ -527,7 +528,7 @@ st.set_page_config(
 st.title("📈 华尔街级加密量化分析助手 · 多周期因子 & 回测")
 st.caption("实时 OKX 行情 · 多周期因子模型 · 机械回测 · 纯分析，不接实盘")
 
-# 侧边栏：策略配置（不再输入账户资金）
+# 侧边栏：策略配置
 st.sidebar.header("🔧 策略与回测参数")
 
 selected_pair = st.sidebar.selectbox(
@@ -627,164 +628,244 @@ main_df = dfs[MAIN_TIMEFRAME]
 fg = fetch_fear_greed()
 global_mkt = fetch_global_market()
 
+# 预先计算多周期信号 & 主周期因子
+tf_signals = build_multi_tf_signals(
+    selected_pair, dfs,
+    long_threshold, short_threshold,
+    atr_sl_mult, atr_tp_mult
+)
+fac_main = compute_factor_series(main_df)
+
 # =========================
-# 上半部分：左主图 + 右多周期分析
+# 顶部：四个小卡片 + 多周期综述
 # =========================
 
-col_left, col_right = st.columns([3, 2])
+st.subheader("🎯 多周期核心信号总览")
 
-with col_left:
-    st.subheader(f"📊 {selected_pair} · {MAIN_TIMEFRAME} 主周期 K 线 & 指标")
+if tf_signals.empty:
+    st.warning("因子数据不足，暂时无法生成多周期信号。")
+else:
+    overall_score = aggregate_score(tf_signals, TF_WEIGHTS)
+    overall_bias = score_to_bias(overall_score, long_threshold, short_threshold)
+    st.metric("多周期综合评分（加权）", f"{overall_score:.1f}", overall_bias)
 
-    fac_main = compute_factor_series(main_df)
-    fig = go.Figure()
+    available_tfs = [tf for tf in TIMEFRAMES if tf in tf_signals.index]
+    cols = st.columns(len(available_tfs))
 
-    fig.add_trace(go.Candlestick(
-        x=main_df.index,
-        open=main_df["open"],
-        high=main_df["high"],
-        low=main_df["low"],
-        close=main_df["close"],
-        name=f"{MAIN_TIMEFRAME} K 线",
-        increasing_line_color="green",
-        decreasing_line_color="red",
-        showlegend=True
-    ))
+    for col, tf in zip(cols, available_tfs):
+        row = tf_signals.loc[tf]
+        direction = row["direction"] if pd.notna(row["direction"]) else "观望"
+        price = row["price"]
 
-    if not fac_main.empty:
-        fig.add_trace(go.Scatter(
-            x=main_df.index,
-            y=fac_main["ema_fast"],
-            name="EMA 20",
-            line=dict(color="deepskyblue", width=1.2)
-        ))
-        fig.add_trace(go.Scatter(
-            x=main_df.index,
-            y=fac_main["ema_slow"],
-            name="EMA 50",
-            line=dict(color="orange", width=1.2)
-        ))
+        if direction == "多":
+            color = "#16c784"
+            dir_text = "多头"
+        elif direction == "空":
+            color = "#ea3943"
+            dir_text = "空头"
+        else:
+            color = "#999999"
+            dir_text = "观望"
 
-        last_atr = fac_main["atr"].iloc[-1]
-        upper_band = main_df["close"] + last_atr * 2
-        lower_band = main_df["close"] - last_atr * 2
+        sl = row["stop_loss"]
+        tp = row["take_profit"]
+        sl_str = f"{sl:.4f}" if pd.notna(sl) else "—"
+        tp_str = f"{tp:.4f}" if pd.notna(tp) else "—"
 
-        fig.add_trace(go.Scatter(
-            x=main_df.index,
-            y=upper_band,
-            name="ATR 上轨",
-            line=dict(color="gray", dash="dot"),
-            opacity=0.5
-        ))
-        fig.add_trace(go.Scatter(
-            x=main_df.index,
-            y=lower_band,
-            name="ATR 下轨",
-            line=dict(color="gray", dash="dot"),
-            opacity=0.5
-        ))
+        trend = row["trend_score"]
+        rsi = row["rsi"]
+        adx = row["adx"]
+        vol_score = row["volatility_score"]
 
-    fig.update_layout(
-        height=550,
-        xaxis_title="时间",
-        yaxis_title="价格 (USDT)",
-        template="plotly_dark"
-    )
+        explain_lines = []
 
-    st.plotly_chart(fig, use_container_width=True)
+        if pd.notna(trend):
+            if trend > 10:
+                explain_lines.append("趋势因子偏多，均线与动量支持多头。")
+            elif trend < -10:
+                explain_lines.append("趋势因子偏空，均线与动量偏向空头。")
+            else:
+                explain_lines.append("趋势信号不强，价格更偏震荡。")
 
-with col_right:
-    st.subheader("🎯 各周期多空信号 & 关键价位一览")
+        if pd.notna(rsi):
+            if rsi < 35:
+                explain_lines.append("RSI 在低位，存在反弹/抄底博弈。")
+            elif rsi > 65:
+                explain_lines.append("RSI 偏高，短期有回调压力。")
 
-    tf_signals = build_multi_tf_signals(
-        selected_pair,
-        dfs,
-        long_threshold,
-        short_threshold,
-        atr_sl_mult,
-        atr_tp_mult
-    )
+        if pd.notna(adx):
+            if adx > 25:
+                explain_lines.append("ADX > 25，趋势强度较高，顺势更有优势。")
+            else:
+                explain_lines.append("ADX < 25，趋势不强，假突破风险较大。")
 
-    if tf_signals.empty:
-        st.warning("因子数据不足，无法生成各周期信号。")
-    else:
-        # 多周期综合评分（加权）
-        overall_score = aggregate_score(tf_signals, TF_WEIGHTS)
-        overall_bias = score_to_bias(overall_score, long_threshold, short_threshold)
+        if pd.notna(vol_score):
+            if vol_score > 10:
+                explain_lines.append("波动率走高，短线机会多但风险也放大。")
+            elif vol_score < -10:
+                explain_lines.append("波动率走低，行情偏窄幅整理。")
 
-        st.metric("多周期综合评分（加权）", f"{overall_score:.1f}", overall_bias)
+        if not explain_lines:
+            explain_lines.append("因子信号较弱，暂无明显风格优势。")
 
-        # 展示各周期详细指标
-        table = tf_signals.copy()
-        table["方向"] = table["direction"].fillna("观望")
-        table = table[[
-            "price", "trend_score", "reversal_score", "volatility_score",
-            "composite_score", "rsi", "adx", "方向", "stop_loss", "take_profit"
-        ]]
+        explain_html = "<br>".join(explain_lines)
 
-        st.dataframe(
-            table.style.format({
-                "price": "{:.4f}",
-                "trend_score": "{:.1f}",
-                "reversal_score": "{:.1f}",
-                "volatility_score": "{:.1f}",
-                "composite_score": "{:.1f}",
-                "rsi": "{:.1f}",
-                "adx": "{:.1f}",
-                "stop_loss": "{:.4f}",
-                "take_profit": "{:.4f}"
-            }),
-            use_container_width=True
-        )
-
-        # 多因子风格剖面（加权雷达图）
-        agg_trend = sum(
-            tf_signals.loc[tf, "trend_score"] * w
-            for tf, w in TF_WEIGHTS.items()
-            if tf in tf_signals.index
-        )
-        agg_reversal = sum(
-            tf_signals.loc[tf, "reversal_score"] * w
-            for tf, w in TF_WEIGHTS.items()
-            if tf in tf_signals.index
-        )
-        agg_vol = sum(
-            tf_signals.loc[tf, "volatility_score"] * w
-            for tf, w in TF_WEIGHTS.items()
-            if tf in tf_signals.index
-        )
-
-        radar_fig = go.Figure()
-        radar_fig.add_trace(go.Scatterpolar(
-            r=[agg_trend, agg_reversal, agg_vol],
-            theta=["趋势因子", "反转因子", "波动率因子"],
-            fill="toself",
-            name="加权风格",
-            line=dict(color="cyan")
-        ))
-        radar_fig.update_layout(
-            title="多因子风格剖面（加权）",
-            polar=dict(
-                radialaxis=dict(visible=True, range=[-60, 60])
-            ),
-            showlegend=False,
-            height=320,
-            template="plotly_dark"
-        )
-        st.plotly_chart(radar_fig, use_container_width=True)
-
-        # 对主周期做一点文字解析，方便快速理解
-        if not fac_main.empty:
-            last_main = fac_main.iloc[-1]
-            st.markdown("**📌 主周期 (4h) 信号拆解：**")
+        with col:
             st.markdown(
-                f"- 趋势：ADX ≈ {last_main['adx']:.1f}，EMA20/50 斜率 ≈ {last_main['ema_slope'] * 100:.2f}%\n"
-                f"- 反转：RSI ≈ {last_main['rsi']:.1f}，价格在布林带位置 ≈ {last_main['bb_position'] * 100:.1f}%\n"
-                f"- 波动：近 20 根收益波动率 ≈ {last_main['volatility'] * 100:.2f}%"
+                f"""
+                <div style="border-radius:10px; border:1px solid {color};
+                            padding:10px; background-color:#050505;">
+                    <div style="color:{color}; font-weight:bold; font-size:16px; margin-bottom:4px;">
+                        {tf} · {TF_DESC.get(tf, "")}
+                    </div>
+                    <div style="font-size:13px; color:white; margin-bottom:4px;">
+                        方向：<b style="color:{color};">{dir_text}</b>
+                        &nbsp;|&nbsp; 价格：{price:.4f}
+                    </div>
+                    <div style="font-size:12px; color:lightgray; margin-bottom:4px;">
+                        止损：{sl_str} · 止盈：{tp_str}
+                    </div>
+                    <div style="font-size:11px; color:#cccccc;">
+                        {explain_html}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
             )
 
 # =========================
-# 中部：回测 & 盈亏分布（主周期 4h）
+# 多周期详细指标 & 风格剖面
+# =========================
+
+st.subheader("📊 多周期详细指标 & 风格剖面")
+
+if tf_signals.empty:
+    st.info("暂无多周期详细指标。")
+else:
+    table = tf_signals.copy()
+    table["方向"] = table["direction"].fillna("观望")
+
+    table_show = table[[
+        "price", "trend_score", "reversal_score", "volatility_score",
+        "composite_score", "rsi", "adx", "方向", "stop_loss", "take_profit"
+    ]]
+
+    st.dataframe(
+        table_show.style.format({
+            "price": "{:.4f}",
+            "trend_score": "{:.1f}",
+            "reversal_score": "{:.1f}",
+            "volatility_score": "{:.1f}",
+            "composite_score": "{:.1f}",
+            "rsi": "{:.1f}",
+            "adx": "{:.1f}",
+            "stop_loss": "{:.4f}",
+            "take_profit": "{:.4f}"
+        }),
+        use_container_width=True
+    )
+
+    # 多因子风格剖面（加权雷达图）
+    agg_trend = sum(
+        tf_signals.loc[tf, "trend_score"] * w
+        for tf, w in TF_WEIGHTS.items()
+        if tf in tf_signals.index
+    )
+    agg_reversal = sum(
+        tf_signals.loc[tf, "reversal_score"] * w
+        for tf, w in TF_WEIGHTS.items()
+        if tf in tf_signals.index
+    )
+    agg_vol = sum(
+        tf_signals.loc[tf, "volatility_score"] * w
+        for tf, w in TF_WEIGHTS.items()
+        if tf in tf_signals.index
+    )
+
+    radar_fig = go.Figure()
+    radar_fig.add_trace(go.Scatterpolar(
+        r=[agg_trend, agg_reversal, agg_vol],
+        theta=["趋势因子", "反转因子", "波动率因子"],
+        fill="toself",
+        name="加权风格",
+        line=dict(color="cyan")
+    ))
+    radar_fig.update_layout(
+        title="多因子风格剖面（加权）",
+        polar=dict(
+            radialaxis=dict(visible=True, range=[-60, 60])
+        ),
+        showlegend=False,
+        height=320,
+        template="plotly_dark"
+    )
+    st.plotly_chart(radar_fig, use_container_width=True)
+
+# =========================
+# 中部：K线图（放在分析下面）
+# =========================
+
+st.markdown("---")
+st.subheader(f"📊 {selected_pair} · {MAIN_TIMEFRAME} K 线 & 技术结构")
+
+fig_k = go.Figure()
+
+fig_k.add_trace(go.Candlestick(
+    x=main_df.index,
+    open=main_df["open"],
+    high=main_df["high"],
+    low=main_df["low"],
+    close=main_df["close"],
+    name=f"{MAIN_TIMEFRAME} K 线",
+    increasing_line_color="green",
+    decreasing_line_color="red",
+    showlegend=True
+))
+
+if not fac_main.empty:
+    fig_k.add_trace(go.Scatter(
+        x=main_df.index,
+        y=fac_main["ema_fast"],
+        name="EMA 20",
+        line=dict(color="deepskyblue", width=1.2)
+    ))
+    fig_k.add_trace(go.Scatter(
+        x=main_df.index,
+        y=fac_main["ema_slow"],
+        name="EMA 50",
+        line=dict(color="orange", width=1.2)
+    ))
+
+    last_atr = fac_main["atr"].iloc[-1]
+    upper_band = main_df["close"] + last_atr * 2
+    lower_band = main_df["close"] - last_atr * 2
+
+    fig_k.add_trace(go.Scatter(
+        x=main_df.index,
+        y=upper_band,
+        name="ATR 上轨",
+        line=dict(color="gray", dash="dot"),
+        opacity=0.5
+    ))
+    fig_k.add_trace(go.Scatter(
+        x=main_df.index,
+        y=lower_band,
+        name="ATR 下轨",
+        line=dict(color="gray", dash="dot"),
+        opacity=0.5
+    ))
+
+fig_k.update_layout(
+    height=550,
+    xaxis_title="时间",
+    yaxis_title="价格 (USDT)",
+    template="plotly_dark"
+)
+
+st.plotly_chart(fig_k, use_container_width=True)
+
+# =========================
+# 回测 & 盈亏分布（主周期 4h）
 # =========================
 
 st.markdown("---")
@@ -829,7 +910,6 @@ else:
         with col6:
             st.metric("单笔平均收益率", f"{stats['avg_ret']:.2f}%")
 
-        # 净值曲线
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(
             x=equity.index,
@@ -853,7 +933,6 @@ else:
         )
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        # 最近 N 笔交易盈亏分布
         st.subheader(f"📊 最近 {n_hist_trades} 笔信号的盈亏分布")
         trades_hist = trades.tail(n_hist_trades)
         fig_hist = px.histogram(
@@ -947,9 +1026,9 @@ with col_a:
 
 with col_b:
     st.markdown("""
-    - 当 **多周期综合评分较高** 且 情绪偏贪婪时：技术多头 + 情绪乐观，适合严格止盈、控制仓位。
+    - 当 **多周期综合评分偏多** 且 情绪偏贪婪时：技术多头 + 情绪乐观，适合严格止盈、控制仓位。
     - 当 **多周期综合评分偏空** 且 情绪极度恐惧时：技术空头 + 情绪冰点，容易出现情绪底，适合分批布局而非梭哈。
-    - BTC 主导率上升且总市值回落时：资金偏防御，山寨风险相对更大。
+    - BTC 主导率上升且总市值回落时：资金偏防御，山寨币相对更危险。
     """)
 
 # =========================
