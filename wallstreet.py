@@ -20,7 +20,7 @@ OKX_CONFIG = {
     "enableRateLimit": True,
     "timeout": 20000,
     "options": {
-        "defaultType": "spot",   # 现货；如果想改永续，可以改为 "swap"
+        "defaultType": "spot",   # 现货；需要永续可以改 "swap"
     },
 }
 
@@ -633,15 +633,15 @@ class MultiFrameChiefAnalyst:
 
 
 # ============================================================
-# 6. UI 渲染（修复 backtest-box 显示为代码的问题）
+# 6. UI 渲染（所有周期统一修复 backtest-box）
 # ============================================================
 
 def render_signal_card(sig: Optional[SignalExplanation]):
     """
-    这里是关键修复点：
-    - 所有 HTML 通过一个 st.markdown(..., unsafe_allow_html=True) 输出
-    - backtest-box 是普通 HTML，不再被当作代码块渲染
-    - div 成对闭合，不再多出 </div></div></div>
+    所有周期共用这一套 HTML 渲染：
+    - backtest-box 作为普通 HTML 片段拼接，不会被当作代码块
+    - 统一 st.markdown(..., unsafe_allow_html=True)
+    - div 成对闭合，避免多 / 少 </div>
     """
     if sig is None:
         st.markdown("<div class='quant-card'>该周期数据不足，暂不输出观点。</div>", unsafe_allow_html=True)
@@ -654,7 +654,6 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         tag_class = "tag-neutral"
 
-    # 头部 + 开 logic-list
     header = f"""
     <div class="quant-card">
       <div class="quant-header">
@@ -669,7 +668,6 @@ def render_signal_card(sig: Optional[SignalExplanation]):
         for r in sig.reasons
     )
 
-    # 止盈止损
     if sig.stop_loss is not None and sig.take_profit_1 is not None:
         dir_word = "做多" if sig.long_score > sig.short_score else "做空"
         dir_class = "bull" if dir_word == "做多" else "bear"
@@ -703,7 +701,6 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         plan_html = "<div class='plan-box'>本周期仅给出方向性参考，不建议机械挂单。</div>"
 
-    # 回测块：普通 HTML，不包在 ``` 代码块里
     if sig.bt_trades > 0 and sig.bt_winrate is not None:
         win = sig.bt_winrate * 100
         rr = sig.bt_avg_rr
@@ -717,7 +714,6 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         bt_html = ""
 
-    # 关闭 logic-list 和 quant-card
     tail = "</div></div>"
 
     st.markdown(header + logic_html + plan_html + bt_html + tail, unsafe_allow_html=True)
@@ -907,7 +903,7 @@ def main():
                 <div class="quant-title">基于「{main_sig.timeframe}」信号的执行模板</div>
                 <div class="quant-tag" style="border-color:{dir_color};color:{dir_color};">{dir_word}</div>
             </div>
-            <div style="font-size:13px;line-height:1.6;">
+            <div style="font-size:13px;line-height:1.6%;">
                 · 当前统计意义上性价比最高的一侧是：<b style="color:{dir_color};">{dir_word}</b><br/>
                 · 入场参考：<b>${entry:,.4f}</b> · 止损保护：<b>${stop:,.4f}</b><br/>
                 · 以你账户 <b>{equity:,.0f} USDT</b>，单笔愿意承担 <b>{risk_pct:.1f}%</b> 风险：<br/>
