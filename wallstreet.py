@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # ============================================================
-# 0. 全局配置：OKX（无代理，以便部署到 share.streamlit.io）
+# 0. 全局配置：OKX（无代理，适配 share.streamlit.io）
 # ============================================================
 
 EXCHANGE_ID = "okx"
@@ -19,11 +19,8 @@ EXCHANGE_ID = "okx"
 OKX_CONFIG = {
     "enableRateLimit": True,
     "timeout": 20000,
-    # 不再配置 proxies，适配 Streamlit Cloud 环境
     "options": {
-        # 使用合约还是现货，你可以按自己喜好调整：
-        # "defaultType": "swap",   # 永续合约
-        "defaultType": "spot",     # 现货
+        "defaultType": "spot",   # 现货；如果想改永续，可以改为 "swap"
     },
 }
 
@@ -205,10 +202,6 @@ class OKXDataEngine:
         self.exchange = exchange_class(config)
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 800) -> Optional[pd.DataFrame]:
-        """
-        从 OKX 拉取 K 线并计算一组完整指标。
-        OKX 的 symbol 形式为 'BTC/USDT' 等。
-        """
         try:
             raw = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as e:
@@ -328,13 +321,13 @@ class SingleFrameAnalyst:
 
         # === 1. 趋势结构 ===
         if price > ema20 > ema50 > ema100:
-            reasons.append("趋势结构：价格强势站在EMA梯队之上，多头主导。")
+            reasons.append("趋势结构：价格强势站在 EMA 梯队上方，多头主导。")
             long_score += 3.0
         elif price < ema20 < ema50 < ema100:
-            reasons.append("趋势结构：价格长期压在EMA梯队下方，空头主导。")
+            reasons.append("趋势结构：价格长时间压在 EMA 梯队下方，空头主导。")
             short_score += 3.0
         else:
-            reasons.append("趋势结构：均线纠缠，趋势不纯，更多是双向博弈。")
+            reasons.append("趋势结构：均线纠缠，方向不纯，更偏向震荡。")
 
         if not math.isnan(adx):
             if adx >= 25:
@@ -343,12 +336,12 @@ class SingleFrameAnalyst:
                     long_score += 1.5
                 else:
                     short_score += 1.5
-                reasons.append(f"ADX ≈ {adx:.1f}，市场确实在走趋势，此时顺势操作更占优势。")
+                reasons.append(f"ADX ≈ {adx:.1f}，说明市场确实在走趋势，此时顺势更占优势。")
             elif adx <= 15:
                 regime = "震荡为主"
-                reasons.append(f"ADX ≈ {adx:.1f}，动能偏弱，更像是刷手续费的区间。")
+                reasons.append(f"ADX ≈ {adx:.1f}，动能不足，容易上下扫止损。")
             else:
-                reasons.append(f"ADX ≈ {adx:.1f}，趋势刚起步，但尚未完全确立。")
+                reasons.append(f"ADX ≈ {adx:.1f}，趋势处在酝酿阶段。")
 
         if not math.isnan(supert_dir):
             if supert_dir > 0:
@@ -361,50 +354,50 @@ class SingleFrameAnalyst:
         # === 2. 动能/反转 ===
         if not math.isnan(rsi):
             if rsi > 70:
-                reasons.append(f"RSI ≈ {rsi:.1f} 明显超买，短期继续向上需要新的增量资金。")
+                reasons.append(f"RSI ≈ {rsi:.1f}，已明显超买，追多性价比不高。")
                 short_score += 1.0
             elif rsi < 30:
-                reasons.append(f"RSI ≈ {rsi:.1f} 明显超卖，情绪过度悲观后更易出现修复。")
+                reasons.append(f"RSI ≈ {rsi:.1f}，已明显超卖，存在情绪修复空间。")
                 long_score += 1.0
 
         if not math.isnan(st_k) and not math.isnan(st_d):
             if st_k < 0.2 and st_d < 0.2 and st_k > st_d:
-                reasons.append("StochRSI：低位金叉，短线多头开始反击。")
+                reasons.append("StochRSI：低位金叉，短线多头反击信号。")
                 long_score += 1.0
             elif st_k > 0.8 and st_d > 0.8 and st_k < st_d:
-                reasons.append("StochRSI：高位死叉，短线多头力量衰减。")
+                reasons.append("StochRSI：高位死叉，短线多头乏力。")
                 short_score += 1.0
 
         if not math.isnan(macd) and not math.isnan(macd_sig) and not math.isnan(macd_hist):
             if macd > macd_sig and macd_hist > prev.get("MACD_HIST", 0):
-                reasons.append("MACD 多头动能柱在放大，资金在加速推高价格。")
+                reasons.append("MACD 多头动能柱放大，资金正在加速推动上涨。")
                 long_score += 1.5
             elif macd < macd_sig and macd_hist < prev.get("MACD_HIST", 0):
-                reasons.append("MACD 空头动能柱在放大，上涨更多是反弹而非反转。")
+                reasons.append("MACD 空头动能柱放大，反弹更像离场机而非起涨点。")
                 short_score += 1.5
 
         # === 3. 波动率 ===
         if not math.isnan(bb_width):
             if bb_width < 0.03:
-                reasons.append(f"布林带带宽 {bb_width*100:.1f}% 极度压缩，大行情往往从这种“闷局”后爆发。")
+                reasons.append(f"布林带带宽 {bb_width*100:.1f}% 极度收缩，大行情前的“屏息期”。")
             elif bb_width > 0.08:
-                reasons.append(f"布林带带宽 {bb_width*100:.1f}% 已较高，波动剧烈，仓位要跟波动匹配。")
+                reasons.append(f"布林带带宽 {bb_width*100:.1f}% 已较高，短线波动剧烈。")
 
         # === 4. 资金流 ===
         if not math.isnan(mfi):
             if mfi > 80:
-                reasons.append(f"MFI ≈ {mfi:.1f}，资金高度集中在多头，边际买盘可能开始减弱。")
+                reasons.append(f"MFI ≈ {mfi:.1f}，资金高度拥挤在多头一侧，边际买盘可能放缓。")
                 short_score += 0.5
             elif mfi < 20:
-                reasons.append(f"MFI ≈ {mfi:.1f}，资金极度撤离后，稍有利好就可能引发剧烈反弹。")
+                reasons.append(f"MFI ≈ {mfi:.1f}，资金极度撤离后，更容易对利好产生放大量反应。")
                 long_score += 0.5
 
         if not math.isnan(obv) and not math.isnan(obv_ma):
             if obv > obv_ma:
-                reasons.append("OBV 高于均线，量价齐升，资金持续净流入。")
+                reasons.append("OBV 高于均线，量价齐升，资金净流入明显。")
                 long_score += 0.5
             elif obv < obv_ma:
-                reasons.append("OBV 低于均线，价格上涨更像“无资金托底”的拉高。")
+                reasons.append("OBV 低于均线，价格上行缺乏资金配合。")
                 short_score += 0.5
 
         # === 5. 综合方向 ===
@@ -441,7 +434,7 @@ class SingleFrameAnalyst:
                 tp2 = price + 3.5 * risk
                 rr1 = 2.0
                 rr2 = 3.5
-                reasons.append("多头止损压在结构低点与1.5 ATR 更深处，让市场真正证明你错了再认输。")
+                reasons.append("多头止损压在结构低点与 1.5 ATR 更深处，让市场证明你真的错了才退出。")
             elif net_score <= -2.0:
                 sl_1 = price + 1.5 * atr
                 sl_2 = recent_high
@@ -451,12 +444,13 @@ class SingleFrameAnalyst:
                 tp2 = price - 3.5 * risk
                 rr1 = 2.0
                 rr2 = 3.5
-                reasons.append("空头止损顶在结构高点与1.5 ATR 之上，只在真正反转时离场。")
+                reasons.append("空头止损顶在结构高点与 1.5 ATR 之上，只在真正反转时离场。")
         else:
-            reasons.append("ATR 数据异常，本周期仅做方向参考，不做精细点位管理。")
+            reasons.append("ATR 数据异常，本周期只建议做方向参考，不建议机械挂单。")
 
-        # === 7. 简单回测：看这套打分在历史上的大致胜率 ===
+        # === 7. 简单因子回测 ===
         bt_trades, bt_winrate, bt_avg_rr = self._simple_backtest()
+
         return SignalExplanation(
             timeframe=self.label,
             regime=regime,
@@ -476,7 +470,6 @@ class SingleFrameAnalyst:
             bt_avg_rr=bt_avg_rr,
         )
 
-    # ------- 简单“因子打分回测” -------
     def _simple_backtest(self, lookback: int = 200) -> Tuple[int, Optional[float], Optional[float]]:
         df = self.df.tail(lookback).copy()
         if len(df) < 80:
@@ -640,10 +633,20 @@ class MultiFrameChiefAnalyst:
 
 
 # ============================================================
-# 6. UI 渲染
+# 6. UI 渲染（已统一修正所有 div 结构）
 # ============================================================
 
 def render_signal_card(sig: Optional[SignalExplanation]):
+    """
+    统一修复：每个卡片的 HTML 都是：
+    <div class="quant-card">
+      <div class="quant-header">...</div>
+      <div class="logic-list">...</div>
+      [plan-box]
+      [backtest-box]
+    </div>
+    只开这 3 层，最后只关 1 个 quant-card，不会再出现多余 </div></div>
+    """
     if sig is None:
         st.markdown("<div class='quant-card'>该周期数据不足，暂不输出观点。</div>", unsafe_allow_html=True)
         return
@@ -655,7 +658,7 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         tag_class = "tag-neutral"
 
-    # 头部（注意：打开了两个 div：quant-card & logic-list）
+    # header + logic-list 容器
     header = f"""
     <div class="quant-card">
       <div class="quant-header">
@@ -704,7 +707,7 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         plan_html = "<div class='plan-box'>本周期仅给出方向性参考，不建议机械挂单。</div>"
 
-    # 回测块本身是一个独立 div，开关自洽，不影响外层结构
+    # 回测块：自身 div 自洽，不影响外部计数
     if sig.bt_trades > 0 and sig.bt_winrate is not None:
         win = sig.bt_winrate * 100
         rr = sig.bt_avg_rr
@@ -718,7 +721,7 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         bt_html = ""
 
-    # 这里要关掉的是 header 里开启的 “logic-list” 和最外层 “quant-card” 两个 div
+    # 这里只需要关掉 logic-list 和 quant-card 各一个 div
     tail = "</div></div>"
 
     st.markdown(header + logic_html + plan_html + bt_html + tail, unsafe_allow_html=True)
@@ -756,7 +759,6 @@ def main():
     with st.sidebar:
         st.subheader("📡 市场选择")
 
-        # OKX 主流交易对（现货）
         COINS = [
             "BTC/USDT", "ETH/USDT", "SOL/USDT", "OKB/USDT",
             "DOGE/USDT", "PEPE/USDT", "WIF/USDT", "SHIB/USDT",
@@ -779,7 +781,6 @@ def main():
         equity = st.number_input("账户总资金 (USDT)", min_value=100.0, value=10000.0, step=100.0)
         risk_pct = st.slider("单笔最大风险占比 (%)", 0.1, 5.0, 1.0, 0.1)
 
-    # ---- 数据引擎 & Ticker ----
     engine = OKXDataEngine(OKX_CONFIG)
     try:
         ticker = engine.exchange.fetch_ticker(symbol)
@@ -815,15 +816,15 @@ def main():
         st.markdown(
             """
         <div class="risk-note">
-        · 我们不是在猜接下来一根K线，而是在评估：<b>现在这个方向，值不值得你为它付出一点风险预算。</b><br/>
-        · 多周期模型，会告诉你：超短线在吵什么、趋势在指向哪里、资金到底站在哪一边。<br/>
-        · 真正的职业化，不是每次都猜对，而是<b>在一套有优势的体系上，长期地、克制地下注。</b>
+        · 我们关注的不是下一根K线的方向，而是：<b>现在这个方向，是否值得你冒一点可控的风险。</b><br/>
+        · 多周期信号，会告诉你：短线在吵什么、趋势在偏向哪里、资金实际站在哪一边。<br/>
+        · 真正的职业交易，本质是：<b>用严谨的风险控制，长期重复一个有统计优势的行为。</b>
         </div>
         """,
             unsafe_allow_html=True,
         )
 
-    # ---- 多周期分析 ----
+    # 多周期分析
     st.markdown("### 🧠 多周期量化评估")
 
     signals: Dict[str, Optional[SignalExplanation]] = {}
@@ -854,7 +855,7 @@ def main():
             if tf in enabled_tfs:
                 render_signal_card(signals.get(tf))
 
-    # ---- 多周期统一裁决 ----
+    # 多周期统一裁决
     chief = MultiFrameChiefAnalyst(signals)
     summary, stance, global_conviction = chief.synthesize()
 
@@ -884,7 +885,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ---- 仓位建议 ----
+    # 仓位建议
     st.markdown("### 📦 仓位与执行建议")
 
     main_sig = None
@@ -894,11 +895,10 @@ def main():
             break
 
     if main_sig is None or main_sig.stop_loss is None:
-        st.info("当前没有找到带有效止损的主操作周期信号，仅建议观望或轻仓试探。")
+        st.info("当前没有带有效止损的主操作周期信号，仅建议观望或轻仓试探。")
     else:
         entry = main_sig.entry_hint
         stop = main_sig.stop_loss
-
         size, max_loss = compute_position(equity, risk_pct, entry, stop, contract_mult=1.0)
 
         dir_word = "做多" if main_sig.long_score > main_sig.short_score else "做空"
@@ -912,92 +912,25 @@ def main():
                 <div class="quant-tag" style="border-color:{dir_color};color:{dir_color};">{dir_word}</div>
             </div>
             <div style="font-size:13px;line-height:1.6;">
-                · 模型当前给出的最具性价比一侧是：<b style="color:{dir_color};">{dir_word}</b><br/>
+                · 当前统计意义上性价比最高的一侧是：<b style="color:{dir_color};">{dir_word}</b><br/>
                 · 入场参考：<b>${entry:,.4f}</b> · 止损保护：<b>${stop:,.4f}</b><br/>
-                · 以你账户 <b>{equity:,.0f} USDT</b>，单笔愿意承受 <b>{risk_pct:.1f}%</b> 风险：<br/>
+                · 以你账户 <b>{equity:,.0f} USDT</b>，单笔愿意承担 <b>{risk_pct:.1f}%</b> 风险：<br/>
                 &nbsp;&nbsp;⇒ 理论最大亏损 ≈ <b>{max_loss:,.2f} USDT</b><br/>
                 &nbsp;&nbsp;⇒ 在当前止损距离下，<b>建议仓位 ≈ {size:,.4f} 币</b>（1x 杠杆等效）。<br/><br/>
-                这套仓位，并不是在诱惑你“梭哈”，而是：<br/>
-                · 把亏损<b>锁在一个你能睡得着觉的数字之内</b>；<br/>
-                · 同时保留足够的头寸，使得<b>当你对的时候，盈利有意义，不是小打小闹。</b>
+                这套仓位，不是让你去梭哈方向，而是：<br/>
+                · 把亏损<b>锁在你心理能接受的区间</b>；<br/>
+                · 同时保留足够体量，让<b>正确的那几次信号，足以改变你的净值曲线。</b>
             </div>
         </div>
         """,
             unsafe_allow_html=True,
         )
 
-    # ---- 图表 ----
+    # 图表
     st.markdown("### 📈 价格行为与关键均线")
 
     chart_tf = "1h" if "1h" in enabled_tfs else (enabled_tfs[-1] if enabled_tfs else "1h")
     df_chart = data_cache.get(chart_tf)
     if df_chart is not None:
         dff = df_chart.tail(200)
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=dff.index,
-                open=dff["open"],
-                high=dff["high"],
-                low=dff["low"],
-                close=dff["close"],
-                increasing_line_color="#4ade80",
-                decreasing_line_color="#fb7185",
-                name="Price",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=dff.index,
-                y=dff["EMA_20"],
-                line=dict(color="#60a5fa", width=1.3),
-                name="EMA 20",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=dff.index,
-                y=dff["EMA_50"],
-                line=dict(color="#fbbf24", width=1.1),
-                name="EMA 50",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=dff.index,
-                y=dff["EMA_200"],
-                line=dict(color="#9ca3af", width=1.0, dash="dot"),
-                name="EMA 200",
-            )
-        )
-        fig.update_layout(
-            template="plotly_dark",
-            height=420,
-            margin=dict(l=10, r=10, t=30, b=20),
-            paper_bgcolor="rgba(5,7,17,1)",
-            plot_bgcolor="rgba(5,7,17,1)",
-            xaxis_rangeslider_visible=False,
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1,
-            ),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown(
-        """
-<div class="risk-note">
-这个终端的真正目的，是帮你把「直觉」变成一套可量化、可回测、可复盘的决策框架。<br/>
-当你开始用固定的风险、固定的仓位规则，去重复执行这些信号的时候，<br/>
-你就已经比 90% 靠情绪下单的交易者，更接近华尔街的游戏方式了。
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
+      
