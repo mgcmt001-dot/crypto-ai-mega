@@ -3,983 +3,1081 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+from datetime import datetime, timedelta
 import requests
-import time
-from datetime import datetime, timezone
-import ta
+import talib
+import warnings
 
-# ==========================
-# Streamlit 全局配置
-# ==========================
-st.set_page_config(
-    page_title="量化炒币分析助手 - OKX 多因子模型",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+warnings.filterwarnings("ignore")
+pd.options.mode.chained_assignment = None
 
-# ==========================
-# 常量配置
-# ==========================
-OKX_BASE_URL = "https://www.okx.com"
+# =========================
+# 全局配置
+# =========================
 
-TF_LABELS = {
-    "15m": "15分钟",
-    "1H": "1小时",
-    "4H": "4小时",
-    "1D": "1天"
-}
+DEFAULT_PAIRS = [
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "XRP-USDT",
+    "ADA-USDT",
+    "DOGE-USDT"
+]
 
-# 为了尽量覆盖过去 3 个月：
-# 15m: 90天≈8640根，取9000略多
-# 1H: 90天≈2160根
-# 4H: 90天≈540根
-# 1D: 90天≈90根，但最多300根
-MAX_CANDLES_BY_TF = {
-    "15m": 9000,
-    "1H": 2160,
-    "4H": 540,
-    "1D": 300,
-}
+TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
-# 多周期权重（针对短线交易偏好，短周期权重大）
+# 多周期权重：越长周期权重越大
 TF_WEIGHTS = {
-    "15m": 0.4,
-    "1H": 0.3,
-    "4H": 0.2,
-    "1D": 0.1,
+    "15m": 0.1,   # 短线噪音多，权重较低
+    "1h": 0.2,
+    "4h": 0.3,    # 波段核心周期
+    "1d": 0.4     # 趋势中枢
 }
 
-# 默认参数
-DEFAULT_INST_ID = "BTC-USDT"
-DEFAULT_CAPITAL = 10000.0  # 美元
-DEFAULT_RISK_PCT = 1.0    # 单笔风险占比
-ATR_MULTIPLIER = 2.5      # 止损 ATR 倍数
-TAKE_PROFIT_R_MULTIPLE = 2.0  # 默认 2R 止盈
-DEFAULT_LONG_THRESHOLD = 25.0
-DEFAULT_SHORT_THRESHOLD = -25.0
-
-# ==========================
-# 工具函数：抓取数据
-# ==========================
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_okx_candles(inst_id: str, bar: str, max_candles: int) -> pd.DataFrame:
-    """
-    从 OKX 抓取 K 线数据（自动拼接多页，尽量覆盖 max_candles 根K线）
-    使用 /market/candles + /market/history-candles
-    """
-    all_rows = []
-
-    # 最新 300 根
-    url_recent = f"{OKX_BASE_URL}/api/v5/market/candles"
-    params = {"instId": inst_id, "bar": bar, "limit": 300}
-
-    try:
-        resp = requests.get(url_recent, params=params, timeout=10)
-        j = resp.json()
-    except Exception as e:
-        st.error(f"请求 OKX 失败: {e}")
-        return pd.DataFrame()
-
-    if j.get("code") != "0":
-        st.error(f"OKX API 返回错误: {j.get('msg')}")
-        return pd.DataFrame()
-
-    rows = j.get("data", [])
-    if not rows:
-        return pd.DataFrame()
-
-    all_rows.extend(rows)
-
-    # 更早历史
-    url_hist = f"{OKX_BASE_URL}/api/v5/market/history-candles"
-
-    while len(all_rows) < max_candles:
-        oldest_ts = rows[-1][0]  # 毫秒时间戳字符串
-        params_hist = {
-            "instId": inst_id,
-            "bar": bar,
-            "before": oldest_ts,
-            "limit": 300
-        }
-        try:
-            resp = requests.get(url_hist, params=params_hist, timeout=10)
-            j = resp.json()
-        except Exception as e:
-            st.warning(f"继续抓取历史K线失败: {e}")
-            break
-
-        if j.get("code") != "0":
-            st.warning(f"OKX 历史K线接口错误: {j.get('msg')}")
-            break
-
-        rows = j.get("data", [])
-        if not rows:
-            break
-
-        all_rows.extend(rows)
-        time.sleep(0.2)  # 简单防止频率过高
-
-    if not all_rows:
-        return pd.DataFrame()
-
-    cols = ["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"]
-    df = pd.DataFrame(all_rows, columns=cols)
-
-    for c in ["open", "high", "low", "close", "vol"]:
-        df[c] = df[c].astype(float)
-
-    df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="ms", utc=True)
-    df = df.drop_duplicates(subset="ts")
-    df = df.sort_values("ts").set_index("ts")
-
-    return df
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fear_greed_index():
-    """
-    贪婪与恐惧指数（来自 alternative.me）
-    返回 (value:int 0~100, classification:str, timestamp:datetime)
-    """
-    url = "https://api.alternative.me/fng/?limit=1"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json().get("data", [])
-        if not data:
-            return None, None, None
-        d = data[0]
-        value = int(d["value"])
-        classification = d["value_classification"]
-        ts = pd.to_datetime(int(d["timestamp"]), unit="s", utc=True)
-        return value, classification, ts
-    except Exception as e:
-        st.warning(f"贪婪与恐惧指数获取失败: {e}")
-        return None, None, None
-
-
-# ==========================
-# 技术指标 & 因子计算
-# ==========================
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """在原始K线基础上添加常用技术指标"""
-    if df.empty:
-        return df
-
-    df = df.copy()
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-
-    # EMA
-    ema_fast_ind = ta.trend.EMAIndicator(close=close, window=20)
-    ema_slow_ind = ta.trend.EMAIndicator(close=close, window=50)
-    df["ema_fast"] = ema_fast_ind.ema_indicator()
-    df["ema_slow"] = ema_slow_ind.ema_indicator()
-
-    # RSI
-    rsi_ind = ta.momentum.RSIIndicator(close=close, window=14)
-    df["rsi"] = rsi_ind.rsi()
-
-    # MACD
-    macd_ind = ta.trend.MACD(close=close)
-    df["macd"] = macd_ind.macd()
-    df["macd_signal"] = macd_ind.macd_signal()
-    df["macd_hist"] = macd_ind.macd_diff()
-
-    # ATR
-    atr_ind = ta.volatility.AverageTrueRange(
-        high=high, low=low, close=close, window=14
-    )
-    df["atr"] = atr_ind.average_true_range()
-
-    # 布林带
-    bb_ind = ta.volatility.BollingerBands(
-        close=close, window=20, window_dev=2
-    )
-    df["bb_high"] = bb_ind.bollinger_hband()
-    df["bb_low"] = bb_ind.bollinger_lband()
-    df["bb_mid"] = bb_ind.bollinger_mavg()
-    df["bb_width"] = (df["bb_high"] - df["bb_low"]) / close
-
-    # ADX
-    adx_ind = ta.trend.ADXIndicator(
-        high=high, low=low, close=close, window=14
-    )
-    df["adx"] = adx_ind.adx()
-
-    return df
-
-
-def add_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    基于指标构建三大风格因子 + 综合多空得分：
-    - 趋势因子：EMA 斜率 + ADX 强度
-    - 反转因子：RSI 偏离 + 布林带位置
-    - 波动率因子：ATR% + 布林带宽度相对历史水平
-    输出:
-      trend_score, reversal_score, vol_score, signal_score
-      范围大致在 [-100, 100]
-    """
-    if df.empty:
-        return df
-
-    df = df.copy()
-
-    # 趋势：EMA 斜率 * ADX 强度
-    df["ema_slope"] = (df["ema_fast"] - df["ema_slow"]) / df["ema_slow"]
-    df["ema_slope"].replace([np.inf, -np.inf], np.nan, inplace=True)
-    df["ema_slope"].fillna(0, inplace=True)
-
-    df["adx_norm"] = df["adx"] / 25.0  # ADX>25 视为趋势较强
-    df["adx_norm"].fillna(0, inplace=True)
-
-    trend_raw = df["ema_slope"] * df["adx_norm"] * 10.0
-    df["trend_score"] = 50.0 * np.tanh(trend_raw)
-
-    # 反转：RSI 偏离 + 布林带位置
-    rsi = df["rsi"].copy()
-    rsi.fillna(50.0, inplace=True)
-    rsi_dev = (50.0 - rsi) / 15.0  # Oversold => 正值，Overbought => 负值
-
-    denom = (df["bb_high"] - df["bb_low"]).replace(0, np.nan)
-    bb_pos = (df["close"] - df["bb_low"]) / denom
-    bb_pos = bb_pos.clip(0.0, 1.0).fillna(0.5)  # 中轨附近记作0.5
-
-    rev_raw = rsi_dev + (0.5 - bb_pos)  # 底部偏多 => 正值
-    df["reversal_score"] = 50.0 * np.tanh(rev_raw)
-
-    # 波动率因子：ATR% + BB 宽度相对过去中位数
-    vol_raw = (df["atr"] / df["close"]).fillna(0) + df["bb_width"].fillna(0)
-    median_vol = vol_raw.rolling(200, min_periods=50).median()
-    vol_ratio = vol_raw / median_vol.replace(0, np.nan)
-    vol_ratio.fillna(1.0, inplace=True)
-
-    df["vol_score"] = 50.0 * (vol_ratio - 1.0)
-    df["vol_score"] = df["vol_score"].clip(-50.0, 50.0)
-
-    # 综合多空评分：趋势为主，反转为辅
-    df["signal_score"] = df["trend_score"] * 0.7 + df["reversal_score"] * 0.3
-    df["signal_score"] = df["signal_score"].clip(-100.0, 100.0)
-
-    return df
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_data_with_factors(inst_id: str, bar: str) -> pd.DataFrame:
-    """整体封装：抓 K 线 + 指标 + 因子"""
-    max_candles = MAX_CANDLES_BY_TF.get(bar, 300)
-    df = fetch_okx_candles(inst_id, bar, max_candles=max_candles)
-    if df.empty:
-        return df
-    df = add_indicators(df)
-    df = add_factor_scores(df)
-    return df
-
-
-def get_last_snapshot(df: pd.DataFrame) -> dict:
-    """获取最新一根K线对应的因子快照"""
-    d = df.dropna().iloc[-1]
-    return {
-        "close": float(d["close"]),
-        "atr": float(d["atr"]),
-        "trend_score": float(d["trend_score"]),
-        "reversal_score": float(d["reversal_score"]),
-        "vol_score": float(d["vol_score"]),
-        "signal_score": float(d["signal_score"]),
-        "rsi": float(d["rsi"]),
-        "adx": float(d["adx"]),
-        "time": df.dropna().index[-1],
-    }
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def multi_tf_analysis(inst_id: str):
-    """
-    多周期分析：15m / 1H / 4H / 1D
-    返回：
-      per_tf: {tf: snapshot}
-      agg: 聚合因子结果
-    """
-    per_tf = {}
-    agg = {"trend": 0.0, "reversal": 0.0, "vol": 0.0, "signal": 0.0}
-    used_weights = 0.0
-
-    for tf, w in TF_WEIGHTS.items():
-        df = load_data_with_factors(inst_id, tf)
-        if df.empty or df.dropna().empty:
-            continue
-        snap = get_last_snapshot(df)
-        per_tf[tf] = snap
-        agg["trend"] += snap["trend_score"] * w
-        agg["reversal"] += snap["reversal_score"] * w
-        # 波动率风格看的是绝对大小
-        agg["vol"] += abs(snap["vol_score"]) * w
-        agg["signal"] += snap["signal_score"] * w
-        used_weights += w
-
-    if used_weights > 0:
-        for k in agg:
-            agg[k] /= used_weights
-
-    return per_tf, agg
-
-
-# ==========================
-# 回测引擎（简化）
-# ==========================
-
-def backtest_strategy(
-    df: pd.DataFrame,
-    long_th: float = DEFAULT_LONG_THRESHOLD,
-    short_th: float = DEFAULT_SHORT_THRESHOLD,
-    atr_mult: float = ATR_MULTIPLIER,
-    tp_r_mult: float = TAKE_PROFIT_R_MULTIPLE,
-):
-    """
-    简单规则：
-      - 使用 signal_score 作为信号
-      - signal_score >= long_th => 下一根K线开盘做多
-      - signal_score <= short_th => 下一根K线开盘做空
-      - 止损：ATR * atr_mult
-      - 止盈：距离= R * tp_r_mult
-      - 信号衰减（多头时 signal_score <= 0 / 空头时 >=0）则平仓
-    忽略手续费与滑点，仅用于研究胜率和风格。
-    """
-    df_bt = df.dropna(subset=["signal_score", "atr"]).copy()
-    if df_bt.shape[0] < 60:
-        return [], pd.Series(dtype=float)
-
-    trades = []
-    equity_curve = []
-    equity = 1.0
-
-    idx = df_bt.index
-    pos = None  # 当前持仓
-
-    for i in range(1, len(df_bt)):
-        t = idx[i]
-        prev_t = idx[i - 1]
-        row = df_bt.iloc[i]
-        prev = df_bt.iloc[i - 1]
-
-        open_price = row["open"]
-        high = row["high"]
-        low = row["low"]
-        signal_prev = prev["signal_score"]
-        atr_prev = prev["atr"]
-
-        # 先检查已有持仓是否需要平仓
-        if pos is not None:
-            exit_reason = None
-            exit_price = None
-
-            if pos["direction"] == "long":
-                stop = pos["stop"]
-                target = pos["target"]
-
-                # 保守处理：同一根K线中若同时到达止损和止盈，认为先止损
-                if low <= stop:
-                    exit_price = stop
-                    exit_reason = "stop"
-                elif high >= target:
-                    exit_price = target
-                    exit_reason = "target"
-                elif signal_prev <= 0:
-                    exit_price = open_price
-                    exit_reason = "signal_fade"
-
-            else:  # short
-                stop = pos["stop"]
-                target = pos["target"]
-                if high >= stop:
-                    exit_price = stop
-                    exit_reason = "stop"
-                elif low <= target:
-                    exit_price = target
-                    exit_reason = "target"
-                elif signal_prev >= 0:
-                    exit_price = open_price
-                    exit_reason = "signal_fade"
-
-            if exit_price is not None:
-                if pos["direction"] == "long":
-                    ret = (exit_price - pos["entry_price"]) / pos["entry_price"]
-                else:
-                    ret = (pos["entry_price"] - exit_price) / pos["entry_price"]
-
-                equity *= (1.0 + ret)
-
-                trades.append(
-                    {
-                        "entry_time": pos["entry_time"],
-                        "exit_time": t,
-                        "direction": pos["direction"],
-                        "entry_price": pos["entry_price"],
-                        "exit_price": exit_price,
-                        "pnl_pct": ret * 100.0,
-                        "reason": exit_reason,
-                    }
-                )
-                equity_curve.append({"time": t, "equity": equity})
-                pos = None
-
-        # 再看是否需要开新仓
-        if pos is None:
-            if signal_prev >= long_th:
-                stop = open_price - atr_mult * atr_prev
-                target = open_price + atr_mult * tp_r_mult * atr_prev
-                pos = {
-                    "direction": "long",
-                    "entry_time": t,
-                    "entry_price": open_price,
-                    "stop": stop,
-                    "target": target,
-                }
-            elif signal_prev <= short_th:
-                stop = open_price + atr_mult * atr_prev
-                target = open_price - atr_mult * tp_r_mult * atr_prev
-                pos = {
-                    "direction": "short",
-                    "entry_time": t,
-                    "entry_price": open_price,
-                    "stop": stop,
-                    "target": target,
-                }
-
-    if equity_curve:
-        eq_series = pd.Series(
-            [e["equity"] for e in equity_curve],
-            index=[e["time"] for e in equity_curve],
-        ).sort_index()
+MAX_LIMIT = 1500           # 单次从 OKX 拉取的最大K线数量
+FEE_RATE = 0.0005          # 模拟交易手续费（单边 0.05%）
+MIN_BARS_FOR_FACTORS = 60  # 起码要有这么多K线才谈得上因子
+
+
+# =========================
+# 工具函数：OKX 数据获取
+# =========================
+
+def tf_to_okx_bar(tf: str) -> str:
+    """将自定义周期转成 OKX bar 参数"""
+    # OKX bar: 1m, 5m, 15m, 1H, 4H, 1D, ...
+    if tf.endswith("m"):   # 分钟
+        return tf
+    if tf.endswith("h"):   # 小时
+        return tf[:-1] + "H"
+    if tf.endswith("d"):   # 日
+        return tf[:-1] + "D"
+    return tf
+
+
+def estimate_bars(tf: str, days: int) -> int:
+    """估算回测期需要多少根K线，最多不超过 MAX_LIMIT"""
+    if tf.endswith("m"):
+        minutes = int(tf[:-1])
+        bars_per_day = 24 * 60 // minutes
+    elif tf.endswith("h"):
+        hours = int(tf[:-1])
+        bars_per_day = 24 // hours
+    elif tf.endswith("d"):
+        bars_per_day = 1
     else:
-        eq_series = pd.Series(dtype=float)
+        bars_per_day = 24
+    return min(MAX_LIMIT, bars_per_day * days + 100)
 
-    return trades, eq_series
 
-
-def summarize_trades(trades):
-    """从交易列表中提取关键统计指标"""
-    if not trades:
+@st.cache_data(ttl=180)
+def fetch_okx_klines(inst_id: str, tf: str, limit: int = 500) -> pd.DataFrame | None:
+    """
+    从 OKX 公共 REST 接口拉取 K 线数据
+    inst_id 例：BTC-USDT
+    tf      例：15m / 1h / 4h / 1d
+    """
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {
+        "instId": inst_id,
+        "bar": tf_to_okx_bar(tf),
+        "limit": limit
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+    except Exception as e:
+        st.error(f"请求 OKX 失败：{e}")
         return None
 
-    df_tr = pd.DataFrame(trades)
-    n = len(df_tr)
-    wins = (df_tr["pnl_pct"] > 0).sum()
-    losses = (df_tr["pnl_pct"] <= 0).sum()
-    win_rate = wins / n if n > 0 else np.nan
+    if r.status_code != 200:
+        st.error(f"OKX HTTP 错误：{r.status_code}")
+        return None
 
-    avg_pnl = df_tr["pnl_pct"].mean()
-    avg_win = df_tr.loc[df_tr["pnl_pct"] > 0, "pnl_pct"].mean()
-    avg_loss = df_tr.loc[df_tr["pnl_pct"] <= 0, "pnl_pct"].mean()
+    js = r.json()
+    if js.get("code") != "0":
+        st.error(f"OKX API 错误：{js.get('msg')}")
+        return None
 
-    total_win = df_tr.loc[df_tr["pnl_pct"] > 0, "pnl_pct"].sum()
-    total_loss = df_tr.loc[df_tr["pnl_pct"] <= 0, "pnl_pct"].sum()
-    profit_factor = (
-        total_win / abs(total_loss) if losses > 0 and total_loss != 0 else np.nan
+    data = js.get("data", [])
+    if not data:
+        st.warning("OKX 返回空数据")
+        return None
+
+    cols = [
+        "ts", "open", "high", "low",
+        "close", "volume", "volCcy",
+        "volCcyQuote", "confirm"
+    ]
+    df = pd.DataFrame(data, columns=cols)
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+
+    float_cols = ["open", "high", "low", "close", "volume"]
+    for c in float_cols:
+        df[c] = df[c].astype(float)
+
+    df.set_index("ts", inplace=True)
+    df.sort_index(inplace=True)
+    return df
+
+
+# =========================
+# 市场情绪 & 全市场指数
+# =========================
+
+@st.cache_data(ttl=600)
+def fetch_fear_greed():
+    """贪婪与恐惧指数（alternative.me）"""
+    url = "https://api.alternative.me/fng/"
+    try:
+        r = requests.get(url, timeout=10)
+        js = r.json()
+        d = js["data"][0]
+        return {
+            "value": int(d["value"]),
+            "classification": d["value_classification"],
+            "timestamp": datetime.fromtimestamp(int(d["timestamp"]))
+        }
+    except Exception as e:
+        st.warning(f"贪婪与恐惧指数获取失败：{e}")
+        return None
+
+
+@st.cache_data(ttl=600)
+def fetch_global_market():
+    """全市场指标（用 CoinGecko 免费 API 代替 CMC，效果类似）"""
+    url = "https://api.coingecko.com/api/v3/global"
+    try:
+        r = requests.get(url, timeout=10)
+        js = r.json()["data"]
+        mcap = js["total_market_cap"]["usd"]
+        vol = js["total_volume"]["usd"]
+        btc_dom = js["market_cap_percentage"]["btc"]
+        mcap_chg = js["market_cap_change_percentage_24h_usd"]
+        return {
+            "mcap": mcap,
+            "volume": vol,
+            "btc_dom": btc_dom,
+            "mcap_change_24h": mcap_chg,
+            "active_coins": js.get("active_cryptocurrencies")
+        }
+    except Exception as e:
+        st.warning(f"全市场指数获取失败：{e}")
+        return None
+
+
+# =========================
+# 多因子计算
+# =========================
+
+def compute_factor_series(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    对单一周期K线计算因子时间序列：
+    - 趋势因子：EMA 斜率 + MACD + ADX
+    - 反转因子：RSI + Bollinger 位置
+    - 波动率因子：近 20 根收益波动 vs 历史中位数
+    - 综合打分：[-100, 100]
+    """
+    if df is None or len(df) < MIN_BARS_FOR_FACTORS:
+        return pd.DataFrame(index=df.index if df is not None else None)
+
+    close = df["close"].values
+    high = df["high"].values
+    low = df["low"].values
+
+    rsi = talib.RSI(close, timeperiod=14)
+    adx = talib.ADX(high, low, close, timeperiod=14)
+    ema_fast = talib.EMA(close, timeperiod=20)
+    ema_slow = talib.EMA(close, timeperiod=50)
+    macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    atr = talib.ATR(high, low, close, timeperiod=14)
+    bb_upper, bb_mid, bb_lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
+
+    ret = pd.Series(close, index=df.index).pct_change()
+    vol20 = ret.rolling(20).std()
+
+    fac = pd.DataFrame(index=df.index)
+    fac["rsi"] = rsi
+    fac["adx"] = adx
+    fac["ema_fast"] = ema_fast
+    fac["ema_slow"] = ema_slow
+    fac["macd"] = macd
+    fac["macd_signal"] = macd_signal
+    fac["macd_hist"] = macd_hist
+    fac["atr"] = atr
+    fac["bb_upper"] = bb_upper
+    fac["bb_mid"] = bb_mid
+    fac["bb_lower"] = bb_lower
+    fac["volatility"] = vol20
+
+    fac["ema_slope"] = (fac["ema_fast"] - fac["ema_slow"]) / fac["ema_slow"]
+    fac["bb_position"] = (df["close"] - fac["bb_lower"]) / (fac["bb_upper"] - fac["bb_lower"])
+    fac["bb_position"] = fac["bb_position"].clip(0, 1)
+
+    # 趋势因子：EMA斜率 + MACD + ADX
+    trend_raw = np.zeros(len(df))
+
+    # EMA斜率：趋势越陡，越接近 +-1
+    trend_raw += np.tanh(fac["ema_slope"].fillna(0) * 50)
+
+    # MACD 动量：按波动标准化
+    macd_std = fac["macd_hist"].rolling(50).std()
+    macd_norm = fac["macd_hist"] / (macd_std + 1e-8)
+    trend_raw += np.tanh(macd_norm.fillna(0))
+
+    # ADX：趋势强度，>20 认为有趋势
+    adx_comp = (fac["adx"] - 20) / 25
+    adx_comp[fac["adx"] < 20] = 0
+    trend_raw += adx_comp.fillna(0)
+
+    fac["trend_score"] = (trend_raw * 20).clip(-50, 50)
+
+    # 反转因子：RSI + Bollinger 位置
+    reversal_raw = np.zeros(len(df))
+    reversal_raw += (50 - fac["rsi"]) / 25.0              # RSI < 50 → 正分（偏多反转）
+    reversal_raw += (0.5 - fac["bb_position"]) * 2.0      # 接近下轨 → 正分
+    fac["reversal_score"] = (reversal_raw * 20).clip(-50, 50)
+
+    # 波动率因子：当前波动 vs 历史中位数
+    base_vol = fac["volatility"].rolling(100).median()
+    vol_ratio = fac["volatility"] / (base_vol + 1e-8)
+    fac["volatility_score"] = ((vol_ratio - 1.0) * 30).clip(-50, 50)
+
+    # 综合评分：趋势 50% + 反转 30% + 波动率方向性加权 20%
+    comp = (
+        0.5 * fac["trend_score"] +
+        0.3 * fac["reversal_score"] +
+        0.2 * np.sign(fac["trend_score"]) * fac["volatility_score"].abs()
     )
+    fac["composite_score"] = comp.clip(-100, 100)
 
-    # 以单笔收益序列近似计算净值 & 最大回撤
-    eq = (1 + df_tr["pnl_pct"] / 100.0).cumprod()
-    peak = eq.cummax()
-    dd = (eq - peak) / peak
-    max_dd = dd.min() * 100.0 if len(dd) > 0 else np.nan
+    return fac
 
-    # Kelly 估计
-    if not np.isnan(avg_win) and not np.isnan(avg_loss) and avg_loss < 0:
-        R = avg_win / abs(avg_loss)
-        kelly = win_rate - (1 - win_rate) / max(R, 1e-6)
+
+def get_latest_factors_all_timeframes(dfs: dict) -> pd.DataFrame:
+    """对每个周期提取最新一条因子值，组成一个表"""
+    rows = []
+    for tf, df in dfs.items():
+        fac = compute_factor_series(df)
+        if fac is None or fac.empty:
+            continue
+        last = fac.iloc[-1]
+        rows.append({
+            "timeframe": tf,
+            "price": df["close"].iloc[-1],
+            "trend_score": last["trend_score"],
+            "reversal_score": last["reversal_score"],
+            "volatility_score": last["volatility_score"],
+            "composite_score": last["composite_score"],
+            "rsi": last["rsi"],
+            "adx": last["adx"],
+            "atr": last["atr"],
+            "bb_position": last["bb_position"]
+        })
+    if not rows:
+        return pd.DataFrame()
+    table = pd.DataFrame(rows).set_index("timeframe")
+    return table
+
+
+def aggregate_score(factor_table: pd.DataFrame, weights: dict) -> float:
+    """按周期权重对综合评分进行加权平均"""
+    if factor_table is None or factor_table.empty:
+        return 0.0
+    s, w_sum = 0.0, 0.0
+    for tf, w in weights.items():
+        if tf in factor_table.index:
+            s += factor_table.loc[tf, "composite_score"] * w
+            w_sum += w
+    if w_sum == 0:
+        return 0.0
+    return float(s / w_sum)
+
+
+def score_to_bias(score: float, long_thr: float, short_thr: float) -> str:
+    """把综合分数转成简单多空意见"""
+    if score >= long_thr:
+        return "偏多"
+    if score <= short_thr:
+        return "偏空"
+    return "震荡/观望"
+
+
+# =========================
+# 实时信号 & 仓位建议
+# =========================
+
+def generate_realtime_signal(
+    inst_id: str,
+    dfs: dict,
+    main_tf: str,
+    capital: float,
+    long_thr: float,
+    short_thr: float,
+    sl_mult: float,
+    tp_mult: float,
+    risk_frac: float
+):
+    """多周期综合信号 + 主周期仓位建议"""
+    factor_table = get_latest_factors_all_timeframes(dfs)
+    agg_score = aggregate_score(factor_table, TF_WEIGHTS)
+
+    main_df = dfs[main_tf]
+    main_fac = compute_factor_series(main_df)
+    if main_fac is None or main_fac.empty:
+        return {
+            "direction": None,
+            "agg_score": agg_score,
+            "factor_table": factor_table,
+            "main_factors": None
+        }
+
+    last_fac = main_fac.iloc[-1]
+    price = float(main_df["close"].iloc[-1])
+    atr = float(last_fac["atr"])
+
+    direction = None
+    if agg_score >= long_thr:
+        direction = "long"
+    elif agg_score <= short_thr:
+        direction = "short"
+
+    if direction is None or np.isnan(atr) or atr <= 0:
+        return {
+            "direction": None,
+            "agg_score": agg_score,
+            "factor_table": factor_table,
+            "main_factors": last_fac,
+            "price": price,
+            "position_size": 0.0,
+            "stop_loss": None,
+            "take_profit": None
+        }
+
+    # 价位 & 止盈止损
+    if direction == "long":
+        stop_loss = price - sl_mult * atr
+        take_profit = price + tp_mult * atr
     else:
-        kelly = np.nan
+        stop_loss = price + sl_mult * atr
+        take_profit = price - tp_mult * atr
+
+    # 仓位：按风险金额 = capital * risk_frac
+    risk_amount = capital * risk_frac
+    unit_risk = abs(price - stop_loss)
+    if unit_risk <= 0:
+        size = 0.0
+    else:
+        size = risk_amount / unit_risk
+
+    base = inst_id.split("-")[0]
+    if base == "BTC":
+        size = round(size, 4)
+    elif base in ["ETH", "SOL"]:
+        size = round(size, 3)
+    else:
+        size = round(size, 0)
 
     return {
-        "n_trades": n,
-        "win_rate": win_rate,
-        "avg_pnl": avg_pnl,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "profit_factor": profit_factor,
-        "max_dd": max_dd,
-        "kelly": kelly,
-        "df_trades": df_tr,
+        "direction": direction,
+        "agg_score": agg_score,
+        "factor_table": factor_table,
+        "main_factors": last_fac,
+        "price": price,
+        "position_size": size,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit
     }
 
 
-# ==========================
-# 仓位管理
-# ==========================
+# =========================
+# 回测引擎（主周期）
+# =========================
 
-def calc_position_size(
-    capital_usd: float,
-    risk_pct: float,
-    price: float,
-    atr: float,
-    atr_mult: float = ATR_MULTIPLIER,
-    kelly: float | None = None,
+def backtest_on_dataframe(
+    df: pd.DataFrame,
+    long_thr: float,
+    short_thr: float,
+    sl_mult: float,
+    tp_mult: float,
+    init_capital: float,
+    risk_frac: float,
+    max_holding_bars: int = 40
 ):
     """
-    基于 ATR 止损距离 + 风险占比 + Kelly 调整建议仓位（币数）
+    在指定周期 df 上做回测：
+    - 依据 composite_score 触发开仓
+    - 按 ATR 设置止盈止损
+    - 使用下一根K线的高低价判断是否触及止损/止盈
+    - 单次最多一笔仓位
     """
-    if np.isnan(price) or np.isnan(atr) or atr <= 0:
-        return 0.0, 0.0, 0.0
+    fac = compute_factor_series(df)
+    if fac is None or fac.empty:
+        return None, None
 
-    stop_dist = atr_mult * atr
-    stop_pct = stop_dist / price
+    # 找到第一个因子齐全的 index
+    valid = ~fac["composite_score"].isna()
+    if not valid.any():
+        return None, None
+    start_idx = np.where(valid.values)[0][0]
 
-    if stop_pct <= 0:
-        return 0.0, 0.0, 0.0
+    capital = init_capital
+    equity_list = [capital]
+    equity_index = [df.index[start_idx]]
 
-    base_risk_pct = risk_pct / 100.0
+    trades = []
+    position = None  # 当前持仓
 
-    # 若有 Kelly 估计，则做一个柔和调节
-    kelly_adj = 1.0
-    if kelly is not None and not np.isnan(kelly):
-        # 理论 Kelly*f, 但我们限制在 [0.25, 1.5] 之间
-        kelly_adj = float(np.clip(1.0 + kelly, 0.25, 1.5))
+    for i in range(start_idx, len(df) - 1):
+        row = df.iloc[i]
+        nxt = df.iloc[i + 1]
+        frow = fac.iloc[i]
 
-    effective_risk_pct = base_risk_pct * kelly_adj
-    effective_risk_pct = float(np.clip(effective_risk_pct, 0.001, 0.05))  # 0.1% ~ 5%
+        if position is None:
+            score = frow["composite_score"]
+            direction = None
+            if score >= long_thr:
+                direction = "long"
+            elif score <= short_thr:
+                direction = "short"
 
-    risk_capital = capital_usd * effective_risk_pct
-    position_notional = risk_capital / stop_pct
-    position_notional = min(position_notional, capital_usd)  # 不超过总资金
+            if direction is not None and not np.isnan(frow["atr"]) and frow["atr"] > 0:
+                entry_price = float(row["close"])
+                atr = float(frow["atr"])
 
-    coins = position_notional / price
+                if direction == "long":
+                    sl = entry_price - sl_mult * atr
+                    tp = entry_price + tp_mult * atr
+                else:
+                    sl = entry_price + sl_mult * atr
+                    tp = entry_price - tp_mult * atr
 
-    return coins, effective_risk_pct * 100.0, stop_pct * 100.0
+                unit_risk = abs(entry_price - sl)
+                if unit_risk <= 0:
+                    equity_list.append(capital)
+                    equity_index.append(nxt.name)
+                    continue
 
+                risk_amount = capital * risk_frac
+                size = risk_amount / unit_risk
 
-# ==========================
-# 可视化组件
-# ==========================
+                position = {
+                    "entry_time": row.name,
+                    "entry_price": entry_price,
+                    "direction": direction,
+                    "sl": sl,
+                    "tp": tp,
+                    "size": size,
+                    "entry_idx": i
+                }
 
-def plot_price_chart(df: pd.DataFrame, title: str):
-    """K线 + EMA + 布林带"""
-    if df.empty:
-        return go.Figure()
-
-    df_plot = df.tail(300).copy()
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=df_plot.index,
-            open=df_plot["open"],
-            high=df_plot["high"],
-            low=df_plot["low"],
-            close=df_plot["close"],
-            name="K线",
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_plot.index,
-            y=df_plot["ema_fast"],
-            name="EMA20",
-            line=dict(color="#42a5f5", width=1.5),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df_plot.index,
-            y=df_plot["ema_slow"],
-            name="EMA50",
-            line=dict(color="#ab47bc", width=1.5),
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_plot.index,
-            y=df_plot["bb_high"],
-            name="Bollinger 上轨",
-            line=dict(color="rgba(200,200,200,0.5)", width=1, dash="dot"),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df_plot.index,
-            y=df_plot["bb_low"],
-            name="Bollinger 下轨",
-            line=dict(color="rgba(200,200,200,0.5)", width=1, dash="dot"),
-            fill="tonexty",
-            fillcolor="rgba(200,200,200,0.1)",
-        )
-    )
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="时间",
-        yaxis_title="价格",
-        xaxis_rangeslider_visible=False,
-        template="plotly_dark",
-        height=500,
-        margin=dict(l=10, r=10, t=40, b=10),
-    )
-
-    return fig
-
-
-def plot_style_radar(agg_style: dict):
-    """多因子风格剖面雷达图"""
-    trend = agg_style.get("trend", 0.0)
-    rev = agg_style.get("reversal", 0.0)
-    vol = agg_style.get("vol", 0.0)
-
-    # 映射到 0~100
-    def norm(x):
-        return float(np.clip((abs(x) / 100.0) * 100.0, 0, 100))
-
-    r_vals = [norm(trend), norm(rev), norm(vol)]
-    categories = ["趋势因子", "反转因子", "波动率因子"]
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatterpolar(
-            r=r_vals + [r_vals[0]],
-            theta=categories + [categories[0]],
-            fill="toself",
-            name="风格剖面",
-            line=dict(color="#42a5f5"),
-        )
-    )
-
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(
-                visible=True,
-                range=[0, 100],
-                showticklabels=True,
-            )
-        ),
-        showlegend=False,
-        template="plotly_dark",
-        height=400,
-        margin=dict(l=10, r=10, t=20, b=10),
-    )
-    return fig
-
-
-# ==========================
-# Streamlit 主应用
-# ==========================
-
-def main():
-    st.title("💹 量化炒币分析助手（OKX 多周期多因子模型）")
-
-    st.markdown(
-        """
-**说明：**
-
-- 数据源：OKX 公共行情接口（无需 API Key），15m / 1H / 4H / 1D 多周期。
-- 模型：趋势因子 + 反转因子 + 波动率因子，多周期加权，输出综合多空评分（-100 ~ +100）。
-- 功能：
-  - 多周期 K 线图 + 指标
-  - 多空方向建议 + 止盈止损参考
-  - 回测胜率 / 最近 N 笔信号盈亏直方图
-  - 过去约 3 个月机械执行的净值曲线（受 API 历史长度限制）
-  - 基于资金规模 + 波动率的建议仓位（币数）
-  - 贪婪与恐惧指数（情绪辅助）
-
-> **风险提示：** 仅供量化研究与教学，实盘请自担风险，并做好仓位与止损。
-"""
-    )
-
-    # 侧边栏参数
-    st.sidebar.header("参数设置")
-
-    inst_id = st.sidebar.text_input("交易对（OKX instId，例如 BTC-USDT）", DEFAULT_INST_ID)
-
-    tf_choice = st.sidebar.selectbox(
-        "回测与信号主周期",
-        options=list(TF_LABELS.keys()),
-        format_func=lambda x: TF_LABELS.get(x, x),
-        index=1,  # 默认 1H
-    )
-
-    capital = st.sidebar.number_input(
-        "账户资金规模（USD）", min_value=100.0, value=DEFAULT_CAPITAL, step=100.0
-    )
-
-    risk_pct = st.sidebar.slider(
-        "单笔最大风险占比（%）", min_value=0.1, max_value=5.0, value=DEFAULT_RISK_PCT, step=0.1
-    )
-
-    n_signals = st.sidebar.slider(
-        "最近 N 笔交易用于盈亏分布统计", min_value=20, max_value=200, value=100, step=10
-    )
-
-    long_th = st.sidebar.slider(
-        "做多信号阈值（signal_score ≥）", min_value=5.0, max_value=60.0, value=DEFAULT_LONG_THRESHOLD, step=5.0
-    )
-    short_th = -st.sidebar.slider(
-        "做空信号阈值（signal_score ≤ -X）", min_value=5.0, max_value=60.0, value=abs(DEFAULT_SHORT_THRESHOLD), step=5.0
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.caption(
-        "建议：短线可用 15m/1H，波段用 4H，趋势用 1D；阈值越高信号越少但质量通常更高。"
-    )
-
-    # ================== 多周期分析 ==================
-    st.subheader("📊 多周期因子分析")
-
-    per_tf, agg = multi_tf_analysis(inst_id)
-
-    if not per_tf:
-        st.error("无法获取该交易对的数据，请检查 instId 是否正确（例如 BTC-USDT）。")
-        return
-
-    # 贪婪恐惧指数
-    fng_value, fng_class, fng_ts = fetch_fear_greed_index()
-
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        # 显示主周期K线
-        df_main = load_data_with_factors(inst_id, tf_choice)
-        if df_main.empty:
-            st.error("主周期数据为空。")
-            return
-        last_price = float(df_main["close"].iloc[-1])
-        fig_price = plot_price_chart(
-            df_main, f"{inst_id} - {TF_LABELS.get(tf_choice, tf_choice)} K线 & 指标"
-        )
-        st.plotly_chart(fig_price, use_container_width=True)
-
-    with col2:
-        st.markdown("**多周期综合因子风格剖面**")
-        fig_radar = plot_style_radar(agg)
-        st.plotly_chart(fig_radar, use_container_width=True)
-
-        st.markdown("**当前多周期综合多空评分**")
-        signal_score_agg = agg.get("signal", 0.0)
-        trend_agg = agg.get("trend", 0.0)
-        rev_agg = agg.get("reversal", 0.0)
-        vol_agg = agg.get("vol", 0.0)
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.metric(
-                "综合多空评分 (−100~+100)",
-                f"{signal_score_agg: .1f}",
-            )
-            st.metric("趋势因子", f"{trend_agg: .1f}")
-        with col_b:
-            st.metric("反转因子", f"{rev_agg: .1f}")
-            st.metric("波动率因子", f"{vol_agg: .1f}")
-
-        st.markdown("---")
-
-        if fng_value is not None:
-            st.markdown("**市场情绪：贪婪与恐惧指数**")
-            st.metric("Fear & Greed Index", f"{fng_value} / 100", fng_class)
-            if fng_value >= 75:
-                st.caption("情绪极度贪婪：追高风险加大，留意风险，减仓或收紧止损更稳妥。")
-            elif fng_value <= 25:
-                st.caption("情绪极度恐惧：容易出现恐慌抛售后的反弹，适合逢低小仓布局，但仍需谨慎。")
-            else:
-                st.caption("情绪中性偏温和，模型信号可靠性相对较高。")
         else:
-            st.caption("暂时无法获取贪婪与恐惧指数。")
+            # 检查平仓
+            exit_price = None
+            reason = None
+            high = float(nxt["high"])
+            low = float(nxt["low"])
 
-    # ================== 多周期详情表 ==================
-    st.markdown("### 🧭 各周期因子评分一览")
+            if position["direction"] == "long":
+                if low <= position["sl"]:
+                    exit_price = position["sl"]
+                    reason = "stop"
+                elif high >= position["tp"]:
+                    exit_price = position["tp"]
+                    reason = "take_profit"
+            else:  # short
+                if high >= position["sl"]:
+                    exit_price = position["sl"]
+                    reason = "stop"
+                elif low <= position["tp"]:
+                    exit_price = position["tp"]
+                    reason = "take_profit"
 
-    tf_table_rows = []
-    for tf, snap in per_tf.items():
-        tf_table_rows.append(
-            {
-                "周期": TF_LABELS.get(tf, tf),
-                "最新时间": snap["time"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                "价格": round(snap["close"], 4),
-                "Trend 趋势因子": round(snap["trend_score"], 1),
-                "Reversal 反转因子": round(snap["reversal_score"], 1),
-                "Vol 波动率因子": round(snap["vol_score"], 1),
-                "综合信号": round(snap["signal_score"], 1),
-                "RSI": round(snap["rsi"], 1),
-                "ADX": round(snap["adx"], 1),
-            }
-        )
-    st.dataframe(pd.DataFrame(tf_table_rows).set_index("周期"))
+            # 时间止盈：超出最大持仓K线数
+            if exit_price is None and (i + 1 - position["entry_idx"] >= max_holding_bars):
+                exit_price = float(nxt["close"])
+                reason = "time_exit"
 
-    # ================== 当前交易建议 ==================
-    st.subheader("🎯 当前模型多空方向 & 止盈止损参考")
+            if exit_price is not None:
+                if position["direction"] == "long":
+                    gross = (exit_price - position["entry_price"]) * position["size"]
+                else:
+                    gross = (position["entry_price"] - exit_price) * position["size"]
 
-    # 使用主周期数据 + 最新因子
-    df_main = df_main.dropna(subset=["signal_score", "atr"])
-    last_row = df_main.iloc[-1]
-    last_signal = float(last_row["signal_score"])
-    last_atr = float(last_row["atr"])
-    last_time = df_main.index[-1]
+                notional = position["entry_price"] * position["size"]
+                fees = notional * FEE_RATE * 2
+                pnl = gross - fees
+                gross_exposure = notional
+                ret_pct = pnl / (gross_exposure + 1e-8) * 100
 
-    direction = "观望"
-    bias_text = ""
-    if last_signal >= long_th:
-        direction = "偏多（做多优先）"
-        if last_signal >= (long_th + 20):
-            bias_text = "多头趋势+动能都较强，适合顺势做多，但注意追高风险。"
-        else:
-            bias_text = "多头信号有效，但强度一般，可考虑分批建仓。"
-    elif last_signal <= short_th:
-        direction = "偏空（做空/做空对冲）"
-        if last_signal <= (short_th - 20):
-            bias_text = "空头趋势明显，反弹多为离场/加空机会。"
-        else:
-            bias_text = "空头信号有效，但力度一般，适合轻仓试空或做对冲。"
+                capital += pnl
+                trades.append({
+                    "entry_time": position["entry_time"],
+                    "exit_time": nxt.name,
+                    "direction": position["direction"],
+                    "entry_price": position["entry_price"],
+                    "exit_price": exit_price,
+                    "size": position["size"],
+                    "pnl": pnl,
+                    "return_pct": ret_pct,
+                    "reason": reason
+                })
+                position = None
+
+        equity_list.append(capital)
+        equity_index.append(nxt.name)
+
+    equity_series = pd.Series(equity_list, index=equity_index)
+    trades_df = pd.DataFrame(trades)
+    return equity_series, trades_df
+
+
+def compute_trade_stats(trades: pd.DataFrame) -> dict:
+    if trades is None or trades.empty:
+        return {}
+
+    wins = trades[trades["pnl"] > 0]
+    losses = trades[trades["pnl"] <= 0]
+    win_rate = len(wins) / len(trades) * 100
+    avg_pnl = trades["pnl"].mean()
+    avg_ret = trades["return_pct"].mean()
+    total_pnl = trades["pnl"].sum()
+
+    cum = trades["pnl"].cumsum()
+    peak = cum.cummax()
+    drawdown = cum - peak
+    max_dd = -drawdown.min() if len(drawdown) > 0 else 0.0
+
+    # 把每笔当作“独立样本”，粗略年化夏普
+    sharpe = 0.0
+    if trades["return_pct"].std() > 0:
+        sharpe = (trades["return_pct"].mean() /
+                  trades["return_pct"].std()) * np.sqrt(252)
+
+    return {
+        "win_rate": win_rate,
+        "avg_pnl": avg_pnl,
+        "avg_ret": avg_ret,
+        "total_pnl": total_pnl,
+        "max_drawdown": max_dd,
+        "sharpe": sharpe,
+        "n_trades": len(trades)
+    }
+
+
+# =========================
+# Streamlit 页面布局
+# =========================
+
+st.set_page_config(
+    page_title="📈 华尔街级加密量化分析助手 · 升级版",
+    layout="wide"
+)
+
+st.title("📈 华尔街级加密量化分析助手 · 多周期因子 + 回测升级版")
+st.caption("实时 OKX 行情 · 多因子多周期模型 · 机械回测 · 无实盘下单（纯分析模式）")
+
+# 侧边栏：策略配置
+st.sidebar.header("🔧 策略配置")
+
+selected_pair = st.sidebar.selectbox(
+    "选择交易对（OKX 现货）",
+    DEFAULT_PAIRS,
+    index=0
+)
+
+main_timeframe = st.sidebar.selectbox(
+    "主交易周期（用于仓位 & 回测）",
+    TIMEFRAMES,
+    index=2  # 默认 4h
+)
+
+capital_input = st.sidebar.number_input(
+    "账户资金规模 (USD)",
+    min_value=100.0,
+    max_value=1_000_000.0,
+    value=10_000.0,
+    step=1_000.0
+)
+
+risk_fraction = st.sidebar.slider(
+    "单笔最大风险占比",
+    min_value=0.005,
+    max_value=0.05,
+    value=0.02,
+    step=0.005,
+    format="%.3f"
+)
+
+long_threshold = st.sidebar.slider(
+    "做多信号阈值",
+    min_value=10,
+    max_value=80,
+    value=30,
+    step=5
+)
+
+short_threshold = st.sidebar.slider(
+    "做空信号阈值",
+    min_value=-80,
+    max_value=-10,
+    value=-30,
+    step=5
+)
+
+atr_sl_mult = st.sidebar.slider(
+    "ATR 止损倍数",
+    min_value=0.5,
+    max_value=5.0,
+    value=2.0,
+    step=0.1
+)
+
+atr_tp_mult = st.sidebar.slider(
+    "ATR 止盈倍数",
+    min_value=0.5,
+    max_value=8.0,
+    value=3.0,
+    step=0.1
+)
+
+backtest_days = st.sidebar.slider(
+    "回测区间（按主周期，近多少天）",
+    min_value=30,
+    max_value=365,
+    value=90,
+    step=15
+)
+
+max_holding_bars = st.sidebar.slider(
+    "最大持仓K线数（时间止盈）",
+    min_value=5,
+    max_value=200,
+    value=40,
+    step=5
+)
+
+n_hist_trades = st.sidebar.slider(
+    "最近 N 笔交易用于盈亏分布",
+    min_value=20,
+    max_value=300,
+    value=100,
+    step=10
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("本工具仅做量化分析与回测示范，不构成任何投资建议。")
+
+
+# =========================
+# 数据获取
+# =========================
+
+st.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据……")
+
+dfs = {}
+for tf in TIMEFRAMES:
+    if tf == main_timeframe:
+        limit = estimate_bars(tf, backtest_days)
     else:
-        direction = "观望（信号不明确）"
-        bias_text = "多空力量暂时均衡，不宜激进建仓，可等待更极端的信号。"
+        limit = 400
+    dfs[tf] = fetch_okx_klines(selected_pair, tf, limit=limit)
 
-    col_signal, col_pos = st.columns(2)
+if any((df is None or df.empty) for df in dfs.values()):
+    st.error("❌ 部分周期数据获取失败，请稍后重试或检查网络。")
+    st.stop()
 
-    with col_signal:
-        st.markdown(
-            f"""
-- 当前时间（主周期）: **{last_time.strftime('%Y-%m-%d %H:%M:%S %Z')}**
-- 最新价格: **{last_price:.4f}**
-- 当前 signal_score: **{last_signal:.1f}**
-- 模型方向判断：**{direction}**
-"""
-        )
-        st.caption(bias_text)
+# 主周期 DataFrame
+main_df = dfs[main_timeframe]
 
-        if last_atr > 0:
-            stop_long = last_price - ATR_MULTIPLIER * last_atr
-            tp_long = last_price + ATR_MULTIPLIER * TAKE_PROFIT_R_MULTIPLE * last_atr
-            stop_short = last_price + ATR_MULTIPLIER * last_atr
-            tp_short = last_price - ATR_MULTIPLIER * TAKE_PROFIT_R_MULTIPLE * last_atr
+# 贪婪恐惧 & 全市场
+fg = fetch_fear_greed()
+global_mkt = fetch_global_market()
 
-            st.markdown("**参考止盈止损（基于 ATR 波动）:**")
-            st.markdown(
-                f"""
-- 若做多：建议止损约 **{stop_long:.4f}**，参考止盈约 **{tp_long:.4f}**
-- 若做空：建议止损约 **{stop_short:.4f}**，参考止盈约 **{tp_short:.4f}**
-"""
-            )
-        else:
-            st.caption("ATR 为 0，无法给出合理的止损/止盈价格。")
 
-    # ================== 回测 + 仓位建议 ==================
-    st.subheader("📈 简单因子打分回测（近约 3 个月）")
+# =========================
+# 上半部分：K线 + 实时信号
+# =========================
 
-    trades, eq_series = backtest_strategy(
-        df_main, long_th=long_th, short_th=short_th
+col_left, col_right = st.columns([3, 2])
+
+with col_left:
+    st.subheader(f"📊 {selected_pair} · {main_timeframe} 主周期 K 线 & 指标")
+
+    fac_main = compute_factor_series(main_df)
+    fig = go.Figure()
+
+    fig.add_trace(go.Candlestick(
+        x=main_df.index,
+        open=main_df["open"],
+        high=main_df["high"],
+        low=main_df["low"],
+        close=main_df["close"],
+        name=f"{main_timeframe} K 线",
+        increasing_line_color="green",
+        decreasing_line_color="red",
+        showlegend=True
+    ))
+
+    if not fac_main.empty:
+        fig.add_trace(go.Scatter(
+            x=main_df.index,
+            y=fac_main["ema_fast"],
+            name="EMA 20",
+            line=dict(color="deepskyblue", width=1.2)
+        ))
+        fig.add_trace(go.Scatter(
+            x=main_df.index,
+            y=fac_main["ema_slow"],
+            name="EMA 50",
+            line=dict(color="orange", width=1.2)
+        ))
+
+        last_atr = fac_main["atr"].iloc[-1]
+        upper_band = main_df["close"] + last_atr * 2
+        lower_band = main_df["close"] - last_atr * 2
+
+        fig.add_trace(go.Scatter(
+            x=main_df.index,
+            y=upper_band,
+            name="ATR 上轨",
+            line=dict(color="gray", dash="dot"),
+            opacity=0.5
+        ))
+        fig.add_trace(go.Scatter(
+            x=main_df.index,
+            y=lower_band,
+            name="ATR 下轨",
+            line=dict(color="gray", dash="dot"),
+            opacity=0.5
+        ))
+
+    fig.update_layout(
+        height=550,
+        xaxis_title="时间",
+        yaxis_title="价格 (USDT)",
+        template="plotly_dark"
     )
-    stats = summarize_trades(trades)
 
-    if not trades or stats is None:
-        st.warning("历史数据不足以回测，或当前参数下没有产生足够的信号。")
-        return
+    st.plotly_chart(fig, use_container_width=True)
 
-    df_tr = stats["df_trades"]
+with col_right:
+    st.subheader("🎯 多周期综合信号 & 仓位建议")
 
-    with col_pos:
-        # 仓位建议（使用主周期 ATR）
-        coins, eff_risk_pct, stop_pct = calc_position_size(
-            capital_usd=capital,
-            risk_pct=risk_pct,
-            price=last_price,
-            atr=last_atr,
-            atr_mult=ATR_MULTIPLIER,
-            kelly=stats["kelly"],
+    signal_info = generate_realtime_signal(
+        selected_pair,
+        dfs,
+        main_timeframe,
+        capital_input,
+        long_threshold,
+        short_threshold,
+        atr_sl_mult,
+        atr_tp_mult,
+        risk_fraction
+    )
+
+    direction = signal_info["direction"]
+    agg_score = signal_info["agg_score"]
+    price = signal_info.get("price", np.nan)
+    size = signal_info.get("position_size", 0.0)
+    sl = signal_info.get("stop_loss", None)
+    tp = signal_info.get("take_profit", None)
+    factor_table = signal_info["factor_table"]
+    main_factors = signal_info["main_factors"]
+
+    if direction:
+        dir_cn = "做多" if direction == "long" else "做空"
+        st.success(f"当前多周期综合信号：**{dir_cn} {selected_pair}**")
+        st.metric("多周期综合评分", f"{agg_score:.1f}")
+        st.metric("当前价格", f"{price:.4f} USDT")
+        st.metric("建议仓位规模", f"{size:.6f} {selected_pair.split('-')[0]}")
+        if sl and tp:
+            st.metric("止损价", f"{sl:.4f} USDT")
+            st.metric("止盈价", f"{tp:.4f} USDT")
+    else:
+        st.warning("当前无强信号（多周期偏向中性 / 震荡），建议观望或缩小仓位。")
+        st.metric("多周期综合评分", f"{agg_score:.1f}")
+
+    if not factor_table.empty:
+        st.markdown("**🧬 多周期风格剖面（短线 / 中线 / 波段 / 趋势）**")
+
+        table = factor_table.copy()
+        table["bias"] = table["composite_score"].apply(
+            lambda s: score_to_bias(s, long_threshold, short_threshold)
+        )
+        table = table[[
+            "price", "trend_score", "reversal_score",
+            "volatility_score", "composite_score", "rsi", "adx", "bias"
+        ]]
+
+        st.dataframe(
+            table.style.format(
+                {
+                    "price": "{:.4f}",
+                    "trend_score": "{:.1f}",
+                    "reversal_score": "{:.1f}",
+                    "volatility_score": "{:.1f}",
+                    "composite_score": "{:.1f}",
+                    "rsi": "{:.1f}",
+                    "adx": "{:.1f}"
+                }
+            ),
+            use_container_width=True
         )
 
-        st.markdown("**建议仓位（基于波动率 + 风险控制）**")
-        st.markdown(
-            f"""
-- 账户资金：**{capital:.2f} USD**
-- 有效单笔风险占比（结合 Kelly 微调）：**{eff_risk_pct:.2f}%**
-- 对应价格跌幅/涨幅止损距离约：**{stop_pct:.2f}%**
-- 建议单次仓位：**{coins:.4f} {inst_id.split('-')[0]}** （约 {coins * last_price:.2f} USD）
-"""
+        # 汇总风格雷达图（按权重求和）
+        agg_trend = sum(
+            factor_table.loc[tf, "trend_score"] * w
+            for tf, w in TF_WEIGHTS.items()
+            if tf in factor_table.index
         )
-        st.caption("说明：若波动率增大，模型会自动降低建议仓位规模，以控制每笔最大损失。")
+        agg_reversal = sum(
+            factor_table.loc[tf, "reversal_score"] * w
+            for tf, w in TF_WEIGHTS.items()
+            if tf in factor_table.index
+        )
+        agg_vol = sum(
+            factor_table.loc[tf, "volatility_score"] * w
+            for tf, w in TF_WEIGHTS.items()
+            if tf in factor_table.index
+        )
 
-    # 关键回测指标
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown("**回测概览（主周期）**")
-        st.metric("交易笔数", stats["n_trades"])
-        st.metric("胜率", f"{stats['win_rate'] * 100: .1f}%")
-        st.metric("平均每笔收益", f"{stats['avg_pnl']: .2f}%")
+        radar_fig = go.Figure()
+        radar_fig.add_trace(go.Scatterpolar(
+            r=[agg_trend, agg_reversal, agg_vol],
+            theta=["趋势因子", "反转因子", "波动率因子"],
+            fill="toself",
+            name="加权风格",
+            line=dict(color="cyan")
+        ))
+        radar_fig.update_layout(
+            title="多因子风格剖面（加权）",
+            polar=dict(
+                radialaxis=dict(visible=True, range=[-60, 60])
+            ),
+            showlegend=False,
+            height=320,
+            template="plotly_dark"
+        )
+        st.plotly_chart(radar_fig, use_container_width=True)
 
-    with col_r:
-        st.metric("Profit Factor", f"{stats['profit_factor']: .2f}")
-        st.metric("最大回撤（近似）", f"{stats['max_dd']: .1f}%")
-        if stats["kelly"] is not None and not np.isnan(stats["kelly"]):
-            st.metric("Kelly 估计 (理论仓位比例)", f"{stats['kelly'] * 100: .1f}%")
-        else:
-            st.metric("Kelly 估计", "数据不足")
+    if main_factors is not None:
+        st.markdown("**📌 解析当前主周期信号逻辑（像首席分析师一样解释给自己听）**")
+        explain_lines = []
+        explain_lines.append(
+            f"- 趋势因子：ADX ≈ {main_factors['adx']:.1f}，EMA20/50 斜率 {main_factors['ema_slope'] * 100:.2f}%"
+        )
+        explain_lines.append(
+            f"- 反转因子：RSI ≈ {main_factors['rsi']:.1f}，价格位于布林带 {main_factors['bb_position'] * 100:.1f}% 位置"
+        )
+        explain_lines.append(
+            f"- 波动率因子：近 20 根收益波动率 ≈ {main_factors['volatility'] * 100:.2f}%"
+        )
+        st.markdown("\n".join(explain_lines))
 
-    # 净值曲线
-    if not eq_series.empty:
+
+# =========================
+# 中部：回测 & 盈亏分布
+# =========================
+
+st.markdown("---")
+st.subheader(f"📈 机械执行回测：过去 {backtest_days} 天（主周期 {main_timeframe}）")
+
+# 剪切主周期数据到指定天数
+cutoff = main_df.index[-1] - timedelta(days=backtest_days)
+bt_df = main_df[main_df.index >= cutoff]
+
+if len(bt_df) < MIN_BARS_FOR_FACTORS + 10:
+    st.warning("主周期数据长度不足，无法进行有效回测。请尝试缩短回测区间或选择更长周期。")
+else:
+    with st.spinner("正在运行历史回测引擎（只算不下单）……"):
+        equity, trades = backtest_on_dataframe(
+            bt_df,
+            long_threshold,
+            short_threshold,
+            atr_sl_mult,
+            atr_tp_mult,
+            capital_input,
+            risk_fraction,
+            max_holding_bars=max_holding_bars
+        )
+
+    if equity is None or trades is None or trades.empty:
+        st.warning("回测期间没有产生有效交易（可能阈值过高或市场极度震荡）。")
+    else:
+        stats = compute_trade_stats(trades)
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("总交易笔数", f"{stats['n_trades']}")
+        with col2:
+            st.metric("胜率", f"{stats['win_rate']:.1f}%")
+        with col3:
+            st.metric("累计收益", f"{stats['total_pnl']:.2f} USDT")
+        with col4:
+            st.metric("最大回撤", f"{stats['max_drawdown']:.2f} USDT")
+
+        col5, col6 = st.columns(2)
+        with col5:
+            st.metric("单笔平均收益", f"{stats['avg_pnl']:.2f} USDT")
+        with col6:
+            st.metric("单笔平均收益率", f"{stats['avg_ret']:.2f}%")
+
+        # 净值曲线
         fig_eq = go.Figure()
-        fig_eq.add_trace(
-            go.Scatter(
-                x=eq_series.index,
-                y=eq_series.values,
-                mode="lines",
-                name="净值",
-                line=dict(color="#42a5f5"),
-            )
+        fig_eq.add_trace(go.Scatter(
+            x=equity.index,
+            y=equity.values,
+            mode="lines",
+            name="模拟净值",
+            line=dict(color="gold", width=2)
+        ))
+        fig_eq.add_hline(
+            y=capital_input,
+            line=dict(color="gray", dash="dash"),
+            annotation_text="初始资金",
+            annotation_position="bottom right"
         )
         fig_eq.update_layout(
-            title="如果过去都机械执行模型信号，净值曲线大致会长这样（初始净值=1.0）",
+            title="如果过去这段时间全部机械执行，会长成怎样的净值曲线？",
             xaxis_title="时间",
-            yaxis_title="净值",
-            template="plotly_dark",
+            yaxis_title="账户权益 (USDT)",
             height=400,
-            margin=dict(l=10, r=10, t=40, b=10),
+            template="plotly_dark"
         )
         st.plotly_chart(fig_eq, use_container_width=True)
 
-    # 最近 N 笔盈亏分布直方图
-    st.markdown("### 📉 最近 N 笔信号盈亏分布")
-
-    df_recent_tr = df_tr.tail(n_signals)
-    fig_hist = px.histogram(
-        df_recent_tr,
-        x="pnl_pct",
-        nbins=20,
-        title=f"最近 {len(df_recent_tr)} 笔交易盈亏分布（单位：%）",
-    )
-    fig_hist.update_layout(
-        template="plotly_dark",
-        xaxis_title="单笔收益率 (%)",
-        yaxis_title="次数",
-        bargap=0.05,
-        height=400,
-        margin=dict(l=10, r=10, t=40, b=10),
-    )
-    st.plotly_chart(fig_hist, use_container_width=True)
-
-    st.caption(
-        "观察直方图的偏度和长尾，可以直观感受这套因子模型偏向“高胜率小盈亏”还是“低胜率大盈亏”。"
-    )
-
-    # 展示回测交易表（可选）
-    with st.expander("查看完整回测交易明细"):
-        st.dataframe(
-            df_tr[
-                [
-                    "entry_time",
-                    "exit_time",
-                    "direction",
-                    "entry_price",
-                    "exit_price",
-                    "pnl_pct",
-                    "reason",
-                ]
-            ].sort_values("entry_time"),
-            use_container_width=True,
+        # 最近 N 笔交易盈亏分布
+        st.subheader(f"📊 最近 {n_hist_trades} 笔信号的盈亏分布")
+        trades_hist = trades.tail(n_hist_trades)
+        fig_hist = px.histogram(
+            trades_hist,
+            x="pnl",
+            nbins=20,
+            title="盈亏分布直方图",
+            color_discrete_sequence=["#00FF99"]
         )
+        fig_hist.add_vline(
+            x=trades_hist["pnl"].mean(),
+            line_dash="dash",
+            line_color="red",
+            annotation_text="平均值"
+        )
+        fig_hist.add_vline(
+            x=0,
+            line_dash="dot",
+            line_color="white",
+            annotation_text="盈亏平衡"
+        )
+        fig_hist.update_layout(
+            xaxis_title="单笔盈亏 (USDT)",
+            yaxis_title="频数",
+            template="plotly_dark",
+            height=400
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+        # 交易明细表（可选）
+        with st.expander("查看详细交易记录（开平仓时间、方向、盈亏等）"):
+            show_cols = [
+                "entry_time", "exit_time", "direction",
+                "entry_price", "exit_price", "size",
+                "pnl", "return_pct", "reason"
+            ]
+            st.dataframe(
+                trades[show_cols].sort_values("entry_time"),
+                use_container_width=True
+            )
 
 
-if __name__ == "__main__":
-    main()
+# =========================
+# 情绪 & 全市场指数
+# =========================
+
+st.markdown("---")
+st.subheader("🧠 市场情绪 & 全市场环境")
+
+col_a, col_b = st.columns([1, 2])
+
+with col_a:
+    if fg:
+        color = "green" if fg["value"] >= 70 else "red" if fg["value"] <= 30 else "yellow"
+        st.markdown(
+            f"""
+            <div style="text-align:center; padding:18px; background-color:{color}20;
+                        border-radius:10px; border:1px solid {color}">
+                <h4 style="color:{color}; margin-bottom:0;">贪婪与恐惧指数</h4>
+                <h2 style="color:{color}; margin:4px 0;">{fg['value']}</h2>
+                <p style="color:white; margin:0;">{fg['classification']}</p>
+                <small style="color:lightgray;">
+                    更新时间：{fg['timestamp'].strftime('%Y-%m-%d %H:%M')}
+                </small>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    else:
+        st.info("暂时无法获取贪婪与恐惧指数。")
+
+    if global_mkt:
+        st.markdown("---")
+        st.markdown("**🌍 全市场概览（来自 CoinGecko）**")
+
+        mcap = global_mkt["mcap"]
+        vol = global_mkt["volume"]
+        btc_dom = global_mkt["btc_dom"]
+        chg = global_mkt["mcap_change_24h"]
+
+        def fmt(num):
+            if num >= 1e12:
+                return f"{num / 1e12:.2f} 万亿"
+            if num >= 1e9:
+                return f"{num / 1e9:.2f} 十亿"
+            if num >= 1e6:
+                return f"{num / 1e6:.2f} 百万"
+            return f"{num:.0f}"
+
+        st.metric("加密总市值", f"{fmt(mcap)} USD", f"{chg:+.2f}%/24h")
+        st.metric("24h 总成交额", f"{fmt(vol)} USD")
+        st.metric("BTC 主导率", f"{btc_dom:.2f}%")
+
+with col_b:
+    st.markdown("""
+    **如何把情绪与因子结合？**
+
+    - 当 **多周期综合评分 > 做多阈值** 且 **贪婪指数 > 70**：  
+      → 技术面偏多 + 情绪极度贪婪，适合**控制仓位、严格止盈**，防御“最后一冲”。
+
+    - 当 **综合评分 < 做空阈值** 且 **贪婪指数 < 20**：  
+      → 技术面偏空 + 情绪极度恐惧，容易出现**情绪底 / 左侧机会**，可以用分批建仓 + 更宽止损。
+
+    - 若 **BTC 主导率上升 & 总市值下跌**：  
+      → 资金回流 BTC、防御环境，山寨风险更大；模型信号建议对小币更保守。
+
+    量化的意义，不是预测每一根 K 线，而是：  
+    在任何时刻，**清楚自己站在什么环境、持有什么风格、承担多大风险**。
+    """)
+
+# =========================
+# 页脚
+# =========================
+
+st.markdown("---")
+st.caption("""
+💡 免责声明：本应用仅用于量化研究与教学示范，不构成任何投资建议。  
+加密市场波动极大，请务必控制仓位、严格止损，对自己的资金负责。
+
+你现在已经拥有了一套「华尔街级」的多因子决策终端的雏形：
+- 多周期一致性 → 决定方向与节奏  
+- 因子风格剖面 → 告诉你是在做趋势还是做反转  
+- 机械回测 → 把感觉变成统计  
+- 情绪指标 → 防止在极端情绪中失去理性  
+
+接下来可以继续玩的升级方向（依旧保持**不接实盘**）：
+- 加入多币种「组合回测」，看如果同时按模型交易 BTC+ETH，会怎样；
+- 加入「参数扫描 / 网格搜索」，自动找出某段时间内表现最好的阈值组合；
+- 加一个「策略对比面板」，把两套不同参数的净值曲线叠在一起。
+
+如果你想，我可以下一步帮你：
+- 把回测部分抽成独立模块，便于以后接多种策略；
+- 或者给你加一个「参数扫描页面」，一键看哪种风格最适合当前市场。
+""")
