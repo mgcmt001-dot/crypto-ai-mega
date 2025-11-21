@@ -408,9 +408,9 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
     # 1）评分所在区间：多 / 空 / 中性
     if pd.notna(score):
         if score >= long_thr:
-            lines.append("综合评分处于偏多区间，模型在本周期上明确倾向多头。")
+            lines.append("综合评分偏多，模型在本周期明确倾向多头。")
         elif score <= short_thr:
-            lines.append("综合评分处于偏空区间，模型在本周期上明确倾向空头。")
+            lines.append("综合评分偏空，模型在本周期明确倾向空头。")
         else:
             lines.append("综合评分位于中性区间，多空力量大致均衡。")
 
@@ -418,16 +418,16 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
     if tf in ["15m", "1h"]:
         if direction in ["多", "空"]:
             if dir_4h == direction and dir_1d == direction:
-                lines.append("短周期与 4 小时、日线同向，属于顺大趋势的短线机会。")
+                lines.append("短周期与 4h、日线同向，是顺大趋势的短线机会。")
             elif dir_4h == direction and (dir_1d is None or pd.isna(dir_1d)):
-                lines.append("短周期与 4 小时同向，日线中性，适合做波段内部的跟随。")
+                lines.append("短周期与 4h 同向，日线中性，适合做波段内部的跟随。")
             elif dir_4h not in [None, direction] and not pd.isna(dir_4h):
-                lines.append("短周期方向与 4 小时相反，更像是趋势中的回调/反弹，持仓周期不宜过长。")
+                lines.append(f"短周期方向与 4h 相反，更像是{dir_4h}势中的反弹/回调，持仓周期不宜过长。")
             else:
-                lines.append("短周期信号相对独立，需要结合 4 小时与日线综合判断。")
+                lines.append("短周期信号相对独立，需结合 4h 与日线综合判断。")
         else:
             if dir_4h in ["多", "空"]:
-                lines.append(f"当前短周期无明确信号，但 4 小时偏{dir_4h}，可等待短周期与其共振再行动。")
+                lines.append(f"当前短周期无明确信号，但 4h 偏{dir_4h}，可等待短周期与其共振。")
 
     elif tf == "4h":
         if direction in ["多", "空"] and dir_1d == direction:
@@ -435,9 +435,9 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
         elif direction in ["多", "空"] and dir_1d not in [None, direction] and not pd.isna(dir_1d):
             lines.append("4 小时与日线相反，可能处于日线趋势中的中级反弹/中级回调。")
         elif direction is None and dir_1d in ["多", "空"]:
-            lines.append(f"4 小时震荡，但日线偏{dir_1d}，更适合等待 4 小时方向与日线统一。")
+            lines.append(f"4 小时震荡，但日线偏{dir_1d}，更适合等待 4h 方向与日线统一。")
         else:
-            lines.append("4 小时与日线都偏中性，当前更接近箱体震荡环境。")
+            lines.append("4 小时与日线都偏中性，更接近箱体震荡环境。")
 
     elif tf == "1d":
         if pd.notna(trend) and pd.notna(adx):
@@ -453,38 +453,38 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
     # 3）近 N 根涨跌幅
     if pd.notna(period_ret):
         if period_ret > 0.1:
-            lines.append(f"本周期最近 {PERIOD_RET_LOOKBACK} 根累计上涨约 {period_ret:.1%}，已经走出一段不短的上升行情。")
+            lines.append(f"最近 {PERIOD_RET_LOOKBACK} 根累计涨 {period_ret:.1%}，上升动能较强。")
         elif period_ret < -0.1:
-            lines.append(f"本周期最近 {PERIOD_RET_LOOKBACK} 根累计下跌约 {period_ret:.1%}，处于一段连续回落之后。")
+            lines.append(f"最近 {PERIOD_RET_LOOKBACK} 根累计跌 {period_ret:.1%}，处于连续回落之后。")
 
     # 4）价格在本月高低点区间的位置
     if pd.notna(month_pct):
         if month_pct > 0.8:
-            lines.append("当前价格接近本周期区间高位，上方空间相对有限，追高风险上升。")
+            lines.append("当前价接近近期高位，追高风险上升。")
         elif month_pct < 0.2:
-            lines.append("当前价格接近本周期区间低位，下方空间相对有限，左侧布局意愿会增强。")
+            lines.append("当前价接近近期低位，左侧布局意愿会增强。")
 
     # 5）技术细节：RSI / ADX / 波动率
     if pd.notna(rsi):
         if rsi < 30:
-            lines.append("RSI 已进入超卖区域，左侧抄底资金可能开始活跃。")
+            lines.append("RSI 已进入超卖区域，可能存在反弹博弈机会。")
         elif rsi > 70:
-            lines.append("RSI 已进入超买区域，右侧止盈和短线空头会明显增多。")
+            lines.append("RSI 已进入超买区域，短线回调压力增加。")
 
     if pd.notna(adx):
         if adx > 30:
-            lines.append("ADX 偏高，当前处于单边趋势阶段，顺势比摸顶/摸底更安全。")
+            lines.append("ADX 偏高，当前处在单边趋势阶段，适合顺势。")
         elif adx < 18:
-            lines.append("ADX 偏低，趋势不强，假突破和来回刷单的概率更高。")
+            lines.append("ADX 偏低，趋势不强，假突破概率较高。")
 
     if pd.notna(vol_score):
         if vol_score > 10:
-            lines.append("波动率放大，收益与回撤都会被放大，建议控制杠杆与单笔风险。")
+            lines.append("波动率放大，收益与回撤都会放大。")
         elif vol_score < -10:
-            lines.append("波动率收缩，可能在为下一次放量行情蓄力，更适合轻仓埋伏而非重仓梭哈。")
+            lines.append("波动率收缩，可能在为下次行情蓄力。")
 
     if not lines:
-        lines.append("当前周期各项因子信号偏弱，暂不具备明显优势方向。")
+        lines.append("当前周期各项因子信号偏弱，暂无明显优势方向。")
 
     return lines
 
@@ -745,10 +745,9 @@ st.sidebar.caption("本工具仅作量化分析与回测示范，不涉及真实
 # 数据获取 + 显示“抓取时间”（北京时间）
 # =========================
 
-# 记录真正的抓取时间（UTC）
-fetch_time_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+# ✅ 修复点：直接拿带时区的现在时间，避免 tz_localize 冲突
+fetch_time_utc = pd.Timestamp.now(tz="UTC")
 
-# 用占位容器来更新状态（避免用 st.info() 返回值调用 .success 这种错误）
 status = st.empty()
 status.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据……")
 
@@ -902,7 +901,7 @@ else:
     }
 
     st.dataframe(
-        table_show.style.format(fmt_dict),
+        table_show.style.format(fmt_dict, na_rep="—"),
         use_container_width=True
     )
 
@@ -910,17 +909,17 @@ else:
     agg_trend = sum(
         tf_signals.loc[tf, "trend_score"] * w
         for tf, w in TF_WEIGHTS.items()
-        if tf in tf_signals.index
+        if tf in tf_signals.index and pd.notna(tf_signals.loc[tf, "trend_score"])
     )
     agg_reversal = sum(
         tf_signals.loc[tf, "reversal_score"] * w
         for tf, w in TF_WEIGHTS.items()
-        if tf in tf_signals.index
+        if tf in tf_signals.index and pd.notna(tf_signals.loc[tf, "reversal_score"])
     )
     agg_vol = sum(
         tf_signals.loc[tf, "volatility_score"] * w
         for tf, w in TF_WEIGHTS.items()
-        if tf in tf_signals.index
+        if tf in tf_signals.index and pd.notna(tf_signals.loc[tf, "volatility_score"])
     )
 
     radar_fig = go.Figure()
@@ -977,24 +976,25 @@ if not fac_main.empty:
         line=dict(color="orange", width=1.2)
     ))
 
-    last_atr = fac_main["atr"].iloc[-1]
-    upper_band = main_df["close"] + last_atr * 2
-    lower_band = main_df["close"] - last_atr * 2
+    if not fac_main["atr"].empty and pd.notna(fac_main["atr"].iloc[-1]):
+        last_atr = fac_main["atr"].iloc[-1]
+        upper_band = main_df["close"] + last_atr * 2
+        lower_band = main_df["close"] - last_atr * 2
 
-    fig_k.add_trace(go.Scatter(
-        x=main_df.index,
-        y=upper_band,
-        name="ATR 上轨",
-        line=dict(color="gray", dash="dot"),
-        opacity=0.5
-    ))
-    fig_k.add_trace(go.Scatter(
-        x=main_df.index,
-        y=lower_band,
-        name="ATR 下轨",
-        line=dict(color="gray", dash="dot"),
-        opacity=0.5
-    ))
+        fig_k.add_trace(go.Scatter(
+            x=main_df.index,
+            y=upper_band,
+            name="ATR 上轨",
+            line=dict(color="gray", dash="dot"),
+            opacity=0.5
+        ))
+        fig_k.add_trace(go.Scatter(
+            x=main_df.index,
+            y=lower_band,
+            name="ATR 下轨",
+            line=dict(color="gray", dash="dot"),
+            opacity=0.5
+        ))
 
 fig_k.update_layout(
     height=550,
