@@ -346,11 +346,100 @@ def build_multi_tf_signals(
     df_tf = pd.DataFrame(rows).set_index("timeframe")
     df_tf = df_tf.reindex([tf for tf in TIMEFRAMES if tf in df_tf.index])
 
-    # 关键修正点：把 None 转成 NaN，避免格式化时报 TypeError
+    # 关键：把 None 转成 NaN，避免格式化时报 TypeError
     df_tf["stop_loss"] = pd.to_numeric(df_tf["stop_loss"], errors="coerce")
     df_tf["take_profit"] = pd.to_numeric(df_tf["take_profit"], errors="coerce")
 
     return df_tf
+
+
+def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
+                       long_thr: float, short_thr: float) -> list[str]:
+    """
+    为单个周期卡片生成“有逻辑的分析语句”，
+    结合：本周期因子 + 与 4h、1d 的多空关系。
+    """
+    lines = []
+
+    direction = row["direction"]  # "多" / "空" / None
+    score = row["composite_score"]
+    trend = row["trend_score"]
+    rsi = row["rsi"]
+    adx = row["adx"]
+    vol_score = row["volatility_score"]
+
+    dir_4h = tf_signals.loc[MAIN_TIMEFRAME, "direction"] if MAIN_TIMEFRAME in tf_signals.index else None
+    dir_1d = tf_signals.loc["1d", "direction"] if "1d" in tf_signals.index else None
+
+    # 1）评分所在区间：多 / 空 / 中性
+    if pd.notna(score):
+        if score >= long_thr:
+            lines.append("综合评分处于偏多区间，模型在本周期上明确倾向多头。")
+        elif score <= short_thr:
+            lines.append("综合评分处于偏空区间，模型在本周期上明确倾向空头。")
+        else:
+            lines.append("综合评分位于中性区间，多空力量大致均衡。")
+
+    # 2）本周期在多周期结构中的角色
+    if tf in ["15m", "1h"]:
+        # 短周期 vs 4h / 1d
+        if direction in ["多", "空"]:
+            if dir_4h == direction and dir_1d == direction:
+                lines.append("短周期与 4 小时、日线同向，属于顺大趋势的短线机会。")
+            elif dir_4h == direction and (dir_1d is None or pd.isna(dir_1d)):
+                lines.append("短周期与 4 小时同向，日线中性，适合做波段内部的跟随。")
+            elif dir_4h not in [None, direction] and not pd.isna(dir_4h):
+                lines.append("短周期方向与 4 小时相反，更像是趋势中的回调/反弹，持仓周期不宜拉太长。")
+            else:
+                lines.append("短周期信号相对独立，需要结合 4 小时与日线综合判断。")
+        else:
+            if dir_4h in ["多", "空"]:
+                lines.append(f"当前短周期无明确信号，但 4 小时偏{dir_4h}，可等待短周期与其共振再行动。")
+
+    elif tf == "4h":
+        if direction in ["多", "空"] and dir_1d == direction:
+            lines.append("4 小时与日线同向，是当前主要趋势方向，适合按该方向做波段主线。")
+        elif direction in ["多", "空"] and dir_1d not in [None, direction] and not pd.isna(dir_1d):
+            lines.append("4 小时与日线相反，可能处于日线趋势中的中级反弹/中级回调。")
+        elif direction is None and dir_1d in ["多", "空"]:
+            lines.append(f"4 小时震荡，但日线偏{dir_1d}，更适合等待 4 小时方向与日线统一。")
+        else:
+            lines.append("4 小时与日线都偏中性，当前更接近箱体震荡环境。")
+
+    elif tf == "1d":
+        if pd.notna(trend) and pd.notna(adx):
+            if trend > 15 and adx > 25:
+                lines.append("日线处于明显上升趋势，趋势因子和 ADX 同时支持多头。")
+            elif trend < -15 and adx > 25:
+                lines.append("日线处于明显下降趋势，趋势因子和 ADX 同时偏空。")
+            elif abs(trend) < 10 and adx < 20:
+                lines.append("日线趋势不明显，偏震荡市，大级别不适合追涨杀跌。")
+            else:
+                lines.append("日线处于趋势与震荡之间的过渡阶段，方向感一般。")
+
+    # 3）技术细节：RSI / ADX / 波动率
+    if pd.notna(rsi):
+        if rsi < 30:
+            lines.append("RSI 已进入超卖区域，左侧抄底资金可能开始活跃。")
+        elif rsi > 70:
+            lines.append("RSI 已进入超买区域，右侧止盈和短线空头会明显增多。")
+
+    if pd.notna(adx):
+        if adx > 30:
+            lines.append("ADX 偏高，当前处于单边趋势阶段，顺势比摸顶/摸底更安全。")
+        elif adx < 18:
+            lines.append("ADX 偏低，趋势不强，假突破和来回刷单的概率更高。")
+
+    if pd.notna(vol_score):
+        if vol_score > 10:
+            lines.append("波动率放大，收益与回撤都会被放大，建议控制杠杆与单笔风险。")
+        elif vol_score < -10:
+            lines.append("波动率收缩，可能在为下一次放量行情蓄力，更适合轻仓埋伏而非重仓梭哈。")
+
+    if not lines:
+        lines.append("当前周期各项因子信号偏弱，暂不具备明显优势方向。")
+
+    return lines
 
 
 # =========================
@@ -606,10 +695,10 @@ st.sidebar.markdown("---")
 st.sidebar.caption("本工具仅作量化分析与回测示范，不涉及真实资金与下单。")
 
 # =========================
-# 数据获取
+# 数据获取 + 显示北京时间
 # =========================
 
-st.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据……")
+status_box = st.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据……")
 
 dfs = {}
 for tf in TIMEFRAMES:
@@ -620,10 +709,24 @@ for tf in TIMEFRAMES:
     dfs[tf] = fetch_okx_klines(selected_pair, tf, limit=limit)
 
 if any((df is None or df.empty) for df in dfs.values()):
-    st.error("❌ 部分周期数据获取失败，请稍后重试或检查网络。")
+    status_box.error("部分周期数据获取失败，请稍后重试或检查网络。")
+    st.error("❌ 数据获取失败。")
     st.stop()
 
 main_df = dfs[MAIN_TIMEFRAME]
+
+# 用主周期最新一根K线时间，转换为北京时间展示
+try:
+    last_ts = main_df.index[-1]
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.tz_localize("UTC")  # OKX 时间戳按UTC处理
+    bj_ts = last_ts.tz_convert("Asia/Shanghai")
+    ts_str = bj_ts.strftime("%Y年%m月%d日 %H:%M:%S")
+    status_box.success(
+        f"已从 OKX 获取 {selected_pair} 多周期数据，最新 {MAIN_TIMEFRAME} K 线时间：{ts_str}（北京时间）"
+    )
+except Exception:
+    status_box.success(f"已从 OKX 获取 {selected_pair} 多周期数据。")
 
 fg = fetch_fear_greed()
 global_mkt = fetch_global_market()
@@ -672,43 +775,8 @@ else:
         sl_str = f"{sl:.4f}" if pd.notna(sl) else "—"
         tp_str = f"{tp:.4f}" if pd.notna(tp) else "—"
 
-        trend = row["trend_score"]
-        rsi = row["rsi"]
-        adx = row["adx"]
-        vol_score = row["volatility_score"]
-
-        explain_lines = []
-
-        if pd.notna(trend):
-            if trend > 10:
-                explain_lines.append("趋势因子偏多，均线与动量支持多头。")
-            elif trend < -10:
-                explain_lines.append("趋势因子偏空，均线与动量偏向空头。")
-            else:
-                explain_lines.append("趋势信号不强，价格更偏震荡。")
-
-        if pd.notna(rsi):
-            if rsi < 35:
-                explain_lines.append("RSI 在低位，存在反弹/抄底博弈。")
-            elif rsi > 65:
-                explain_lines.append("RSI 偏高，短期有回调压力。")
-
-        if pd.notna(adx):
-            if adx > 25:
-                explain_lines.append("ADX > 25，趋势强度较高，顺势更有优势。")
-            else:
-                explain_lines.append("ADX < 25，趋势不强，假突破风险较大。")
-
-        if pd.notna(vol_score):
-            if vol_score > 10:
-                explain_lines.append("波动率走高，短线机会多但风险也放大。")
-            elif vol_score < -10:
-                explain_lines.append("波动率走低，行情偏窄幅整理。")
-
-        if not explain_lines:
-            explain_lines.append("因子信号较弱，暂无明显风格优势。")
-
-        explain_html = "<br>".join(explain_lines)
+        comment_lines = build_card_comment(tf, row, tf_signals, long_threshold, short_threshold)
+        explain_html = "<br>".join(comment_lines)
 
         with col:
             st.markdown(
@@ -1027,7 +1095,7 @@ with col_a:
 with col_b:
     st.markdown("""
     - 当 **多周期综合评分偏多** 且 情绪偏贪婪时：技术多头 + 情绪乐观，适合严格止盈、控制仓位。
-    - 当 **多周期综合评分偏空** 且 情绪极度恐惧时：技术空头 + 情绪冰点，容易出现情绪底，适合分批布局而非梭哈。
+    - 当 **多周期综合评分偏空** 且 情绪极度恐惧时：技术空头 + 情绪冰点，容易出现情绪底，适合分批布局而非重仓梭哈。
     - BTC 主导率上升且总市值回落时：资金偏防御，山寨币相对更危险。
     """)
 
