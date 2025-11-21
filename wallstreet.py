@@ -716,7 +716,11 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         bt_html = ""
 
-    tail = "</div></div>"
+tail = "</div></div>"   # ❌ 旧的
+
+# 改成：
+
+tail = "</div></div>"   # 如果 header 里你只开启了这两层，就保持一致
 
     st.markdown(header + logic_html + plan_html + bt_html + tail, unsafe_allow_html=True)
 
@@ -997,4 +1001,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
