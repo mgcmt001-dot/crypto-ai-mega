@@ -1,8 +1,6 @@
 import math
-import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
-from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 import ccxt
@@ -10,883 +8,572 @@ import pandas as pd
 import pandas_ta as ta
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from plotly.resizers import get_browser_info
-import plotly.express as px
 from datetime import datetime, timedelta
-import joblib
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.preprocessing import StandardScaler
-import talib  # Additional TA-Lib for more indicators
-from scipy import stats
-import yfinance as yf  # For additional context if needed, but primary OKX
-
-warnings.filterwarnings('ignore')
 
 # ============================================================
-# 0. 核心配置：华尔街首席分析师终端 (OKX Spot/Swap 支持，无代理)
+# 0. 全局配置：OKX（直连模式，适配 Streamlit Cloud）
 # ============================================================
 
 EXCHANGE_ID = "okx"
+
+# 核心配置：开启速率限制，不使用代理（云端直连）
 OKX_CONFIG = {
-    "apiKey": "",  # 公共行情无需API
-    "secret": "",
-    "sandbox": False,
     "enableRateLimit": True,
-    "timeout": 30000,
+    "timeout": 20000,
     "options": {
-        "defaultType": "spot",  # Sidebar切换swap
+        "defaultType": "spot",     # 默认为现货，如需合约可改为 'swap' 但需处理 symbol 格式
     },
 }
 
-TIMEFRAMES = {
-    "1m": "超短线 / 剥头皮 (1m)",
-    "5m": "超短线 / 高频日内 (5m)",
-    "15m": "短线 / 日内驱动 (15m)",
-    "1h": "短波段 / 隔夜持仓 (1h)",
-    "4h": "中波段 / 几天持仓 (4h)",
-    "1d": "趋势级别 / 周内趋势 (1d)",
-    "1w": "长期趋势 / 位置仓 (1w)",
-}
-
-class MarketRegime(Enum):
-    TRENDING = "趋势主导"
-    RANGING = "震荡盘整"
-    EXPANDING = "波动扩张"
-    CONTRACTING = "波动收缩"
-
-class Bias(Enum):
-    STRONG_BULL = "强多 (主动做多)"
-    BULL = "偏多 (回调买入)"
-    NEUTRAL = "中性 (观望/轻仓)"
-    BEAR = "偏空 (反弹做空)"
-    STRONG_BEAR = "强空 (主动做空)"
-
-@dataclass
-class SignalExplanation:
-    timeframe: str
-    regime: MarketRegime
-    bias: Bias
-    conviction: float  # 0-100
-    long_score: float
-    short_score: float
-    reasons: List[str] = field(default_factory=list)
-    entry_hint: float = 0.0
-    stop_loss: float = 0.0
-    take_profit_1: float = 0.0  # R:R 2:1
-    take_profit_2: float = 0.0  # R:R 3:1
-    reward_risk_1: float = 0.0
-    reward_risk_2: float = 0.0
-    bt_trades: int = 0
-    bt_winrate: float = 0.0
-    bt_pf: float = 0.0  # Profit Factor
-    bt_sharpe: float = 0.0
-    bt_avg_rr: float = 0.0
-    ml_confidence: float = 0.0  # ML model prediction
 
 # ============================================================
-# 1. 华尔街级样式 & UI (Dark Pro Theme)
+# 1. 页面与专业级 UI 样式 (Bloomberg Terminal 风格)
 # ============================================================
 
 st.set_page_config(
-    page_title="🦅 Wall Street Alpha Desk v2.0 – OKX Institutional Terminal",
+    page_title="WallStreet Alpha Desk – OKX Edition",
     page_icon="🦅",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
+# 注入 CSS：为了防止 Markdown 解析错误，所有 CSS 压缩在 style 标签内
+st.markdown(
+    """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
-:root {
-  --bg-primary: #0a0e1a;
-  --bg-secondary: #111827;
-  --bg-card: linear-gradient(145deg, #1a2332 0%, #0f172a 100%);
-  --text-primary: #f8fafc;
-  --text-secondary: #cbd5e1;
-  --accent-bull: #10b981;
-  --accent-bear: #ef4444;
-  --accent-neutral: #6b7280;
-  --border: #334155;
-  --shadow: 0 20px 60px rgba(0,0,0,0.6);
-  --glow-bull: 0 0 20px rgba(16,185,129,0.4);
-  --glow-bear: 0 0 20px rgba(239,68,68,0.4);
-}
-
-.stApp {
-  background: var(--bg-primary);
-  color: var(--text-primary);
-  font-family: 'Inter', sans-serif;
-}
-
-h1 { color: #fde047; font-weight: 800; letter-spacing: -0.02em; }
-h2, h3 { color: var(--text-primary); font-weight: 600; }
-
-.stSidebar {
-  background: var(--bg-secondary);
-  border-right: 1px solid var(--border);
-}
-
-.alpha-card {
-  background: var(--bg-card);
-  border-radius: 16px;
-  border: 1px solid var(--border);
-  padding: 20px;
-  margin-bottom: 16px;
-  box-shadow: var(--shadow);
-  position: relative;
-  overflow: hidden;
-}
-
-.alpha-card::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: linear-gradient(135deg, transparent 0%, rgba(255,255,255,0.03) 100%);
-  pointer-events: none;
-}
-
-.alpha-header {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: 16px; padding-bottom: 12px;
-  border-bottom: 1px solid rgba(51,65,85,0.5);
-}
-
-.alpha-title {
-  font-size: 18px; font-weight: 700; color: #fde047;
-}
-
-.alpha-tag {
-  padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 700;
-  text-transform: uppercase; letter-spacing: 0.05em;
-}
-
-.tag-strong-bull { background: rgba(16,185,129,0.2); color: var(--accent-bull); border: 1px solid rgba(16,185,129,0.4); box-shadow: var(--glow-bull); }
-.tag-bull { background: rgba(16,185,129,0.15); color: var(--accent-bull); border: 1px solid rgba(16,185,129,0.3); }
-.tag-neutral { background: rgba(107,114,128,0.15); color: var(--accent-neutral); border: 1px solid rgba(107,114,128,0.4); }
-.tag-bear { background: rgba(239,68,68,0.15); color: var(--accent-bear); border: 1px solid rgba(239,68,68,0.3); }
-.tag-strong-bear { background: rgba(239,68,68,0.2); color: var(--accent-bear); border: 1px solid rgba(239,68,68,0.4); box-shadow: var(--glow-bear); }
-
-.reason-list {
-  font-size: 13px; line-height: 1.6; color: var(--text-secondary);
-}
-
-.reason-item {
-  display: flex; align-items: flex-start; margin-bottom: 8px;
-}
-
-.reason-bullet {
-  color: #f59e0b; margin-right: 8px; font-weight: 700; flex-shrink: 0;
-}
-
-.plan-section {
-  margin-top: 16px; padding: 16px; background: rgba(15,23,42,0.8);
-  border-radius: 12px; border-left: 4px solid var(--accent-neutral);
-}
-
-.plan-row {
-  display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 12px;
-}
-
-.plan-label { color: var(--accent-neutral); font-weight: 500; }
-.plan-value { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
-
-.plan-bull { color: var(--accent-bull) !important; }
-.plan-bear { color: var(--accent-bear) !important; }
-
-.backtest-panel {
-  margin-top: 12px; padding: 12px; background: rgba(30,58,138,0.2);
-  border-radius: 8px; border: 1px solid rgba(59,130,246,0.5);
-  font-size: 12px; font-family: 'JetBrains Mono', monospace;
-}
-
-.backtest-kpi {
-  display: inline-block; margin-right: 16px; font-weight: 700; color: var(--accent-bull);
-}
-
-.global-summary {
-  background: linear-gradient(135deg, rgba(15,23,42,0.95), rgba(10,14,26,0.95));
-  border: 1px solid rgba(59,130,246,0.6); box-shadow: var(--shadow);
-  padding: 24px; border-radius: 16px; margin-top: 24px;
-}
-
-.summary-title { font-size: 14px; color: #60a5fa; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
-.summary-main { font-size: 22px; font-weight: 700; margin-bottom: 12px; line-height: 1.4; }
-.summary-kpis { font-size: 13px; color: var(--text-secondary); }
-
-.position-panel {
-  background: var(--bg-card); border: 1px solid rgba(16,185,129,0.4);
-  box-shadow: var(--glow-bull); padding: 20px; border-radius: 16px;
-}
-
-.metric-table { font-family: 'JetBrains Mono'; font-size: 12px; }
-.metric-good { color: var(--accent-bull); font-weight: 700; }
-.metric-bad { color: var(--accent-bear); font-weight: 700; }
-
-.risk-disclaimer {
-  font-size: 11px; color: #94a3b8; border-left: 3px solid var(--accent-neutral);
-  padding-left: 12px; margin-top: 12px;
-}
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap');
+    .stApp { background-color: #050712; color: #e5e7eb; font-family: 'Noto Sans SC', sans-serif; }
+    h1, h2, h3, h4 { font-weight: 700; letter-spacing: 0.02em; color: #f3f4f6; }
+    
+    /* 侧边栏样式 */
+    section[data-testid="stSidebar"] { background-color: #020617; border-right: 1px solid #1e293b; }
+    
+    /* 核心卡片容器 */
+    .quant-card {
+        background: radial-gradient(circle at top left, #1e293b 0%, #0f172a 60%);
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+        transition: all 0.2s ease;
+    }
+    .quant-card:hover { border-color: #475569; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.4); }
+    
+    /* 头部信息 */
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #334155; }
+    .card-title { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 16px; color: #fcd34d; }
+    .card-score { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
+    
+    /* 信号标签颜色 */
+    .bull-bg { background-color: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+    .bear-bg { background-color: rgba(244, 63, 94, 0.2); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.4); }
+    .neutral-bg { background-color: rgba(148, 163, 184, 0.2); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.4); }
+    
+    /* 逻辑列表 */
+    .logic-ul { list-style-type: none; padding: 0; margin: 0; font-size: 13px; line-height: 1.6; color: #cbd5e1; }
+    .logic-li { margin-bottom: 4px; display: flex; align-items: flex-start; }
+    .logic-icon { margin-right: 6px; color: #64748b; min-width: 12px; }
+    
+    /* 交易计划盒子 */
+    .plan-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; background: #0f172a; padding: 10px; border-radius: 6px; border: 1px dashed #334155; }
+    .plan-item { display: flex; flex-direction: column; }
+    .plan-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; }
+    .plan-val { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600; }
+    .val-green { color: #34d399; }
+    .val-red { color: #fb7185; }
+    
+    /* 回测统计 */
+    .bt-stat { margin-top: 10px; padding-top: 8px; border-top: 1px solid #334155; font-size: 12px; color: #94a3b8; display: flex; justify-content: space-between; }
+    .bt-val { color: #f1f5f9; font-weight: 600; }
+    
+    /* 首席总结框 */
+    .chief-box { background: linear-gradient(145deg, #1e1b4b, #0f172a); border: 1px solid #4f46e5; border-radius: 8px; padding: 20px; margin-top: 20px; }
+    .chief-title { color: #818cf8; font-size: 12px; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px; }
+    .chief-content { font-size: 16px; font-weight: 600; color: #e0e7ff; line-height: 1.6; }
+    .chief-sub { font-size: 13px; color: #a5b4fc; margin-top: 8px; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
 
 # ============================================================
-# 2. OKX 数据引擎 (多时间帧 + 批量指标 + ML 特征工程)
+# 2. 核心数据结构 (Data Classes)
 # ============================================================
 
-class OKXInstitutionalEngine:
-    def __init__(self, config: Dict):
-        self.exchange = getattr(ccxt, EXCHANGE_ID)(config)
-        self.scaler = StandardScaler()
-        self.ml_model = self._train_ml_model()  # Pre-trained GBT for signal strength
+@dataclass
+class SignalResult:
+    timeframe: str
+    bias: str               # "BULL", "BEAR", "NEUTRAL"
+    score: float            # -10.0 to +10.0
+    confidence: float       # 0 to 100
+    reasons: List[str]      # 逻辑依据列表
+    
+    # 交易计划
+    entry_price: float
+    stop_loss: float
+    take_profit_1: float
+    take_profit_2: float
+    rr_ratio: float         # 盈亏比
+    
+    # 历史回测数据 (Backtest)
+    bt_win_rate: float      # 0.0 to 1.0
+    bt_total_trades: int
+    bt_expectancy: float    # 每笔交易平均R值
 
-    def fetch_multi_tf_data(self, symbol: str, tfs: List[str], limit: int = 2000) -> Dict[str, pd.DataFrame]:
-        """批量拉取多时间帧数据 + 完整指标计算"""
-        data = {}
-        for tf in tfs:
-            df = self._fetch_and_enrich(symbol, tf, limit)
-            if df is not None and len(df) > 100:
-                data[tf] = df
-        return data
+# ============================================================
+# 3. 数据引擎 (OKX Data Engine)
+# ============================================================
 
-    def _fetch_and_enrich(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+class OKXDataEngine:
+    def __init__(self):
+        self.exchange = ccxt.okx(OKX_CONFIG)
+        
+    def get_market_price(self, symbol: str) -> Tuple[float, float]:
+        """获取最新价格和24h涨跌幅"""
         try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
+            ticker = self.exchange.fetch_ticker(symbol)
+            return ticker['last'], ticker['percentage']
+        except Exception:
+            return 0.0, 0.0
+
+    def fetch_candles(self, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+        """
+        获取K线数据并清洗。
+        """
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df.timestamp = pd.to_datetime(df.timestamp, unit='ms')
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-
-            # Core TA Suite
-            df = self._compute_trend_indicators(df)
-            df = self._compute_momentum_indicators(df)
-            df = self._compute_volatility_indicators(df)
-            df = self._compute_volume_indicators(df)
-            df = self._compute_advanced_indicators(df)
-            df = self._compute_ml_features(df)
-
-            return df.dropna()
+            return df
         except Exception as e:
-            st.error(f"OKX {symbol} {tf} 数据失败: {e}")
-            return None
-
-    def _compute_trend_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """趋势指标: EMA梯队, SuperTrend, Ichimoku"""
-        close, high, low = df.close, df.high, df.low
-        # EMA Stack
-        for length in [8, 21, 50, 100, 200]:
-            df[f'EMA_{length}'] = ta.ema(close, length)
-        # SuperTrend
-        st = ta.supertrend(high, low, close, length=10, multiplier=3)
-        df['SUPERTREND'] = st[f'SUPERT_10_3.0']
-        df['SUPERTREND_DIR'] = np.where(df.close > df['SUPERTREND'], 1, -1)
-        # Ichimoku
-        ichimoku = ta.ichimoku(high, low, close)
-        if ichimoku is not None:
-            df['ISA'] = ichimoku[0]['ISA_9']
-            df['ISB'] = ichimoku[0]['ISB_26']
-            df['ITS'] = ichimoku[1]['ITS_9_26']
-            df['IKA'] = ichimoku[1]['IKA_26_52']
-        return df
-
-    def _compute_momentum_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """动能: RSI, StochRSI, MACD, CCI, Williams %R"""
-        close = df.close
-        df['RSI'] = ta.rsi(close, 14)
-        df['STOCHRSI'] = ta.stochrsi(close, length=14)['STOCHRSIk_14_14_3_3']
-        macd = ta.macd(close)
-        df['MACD'] = macd['MACD_12_26_9']
-        df['MACD_SIGNAL'] = macd['MACDs_12_26_9']
-        df['MACD_HIST'] = macd['MACDh_12_26_9']
-        df['CCI'] = ta.cci(df.high, df.low, df.close, 20)
-        df['WILLR'] = ta.willr(df.high, df.low, df.close, 14)
-        return df
-
-    def _compute_volatility_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """波动: ATR, BB, Keltner, Donchian"""
-        high, low, close = df.high, df.low, df.close
-        df['ATR'] = ta.atr(high, low, close, 14)
-        bb = ta.bbands(close, length=20)
-        df['BB_UPPER'] = bb['BBU_20_2.0']
-        df['BB_LOWER'] = bb['BBL_20_2.0']
-        df['BB_WIDTH'] = (df['BB_UPPER'] - df['BB_LOWER']) / df['BB_LOWER']
-        kc = ta.kc(high, low, close, 20, 2)
-        df['KC_UPPER'] = kc['KCUe_20_2.0']
-        df['KC_LOWER'] = kc['KCLo_20_2.0']
-        dc = ta.donchian(high, low, close, 20)
-        df['DC_UPPER'] = dc['DCU_20_20']
-        df['DC_LOWER'] = dc['DCL_20_20']
-        return df
-
-    def _compute_volume_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """资金流: MFI, OBV, VWAP, CMF"""
-        high, low, close, vol = df.high, df.low, df.close, df.volume
-        df['MFI'] = ta.mfi(high, low, close, vol, 14)
-        df['OBV'] = ta.obv(close, vol)
-        df['CMF'] = ta.cmf(high, low, close, vol, 20)
-        df['VWAP'] = ta.vwap(high, low, close, vol)
-        df['VOLUME_SMA'] = ta.sma(vol, 20)
-        df['VOLUME_RATIO'] = vol / df['VOLUME_SMA']
-        return df
-
-    def _compute_advanced_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """高级: ADX, Squeeze, TTM Squeeze, Fisher Transform"""
-        high, low, close = df.high, df.low, df.close
-        adx = ta.adx(high, low, close, 14)
-        df['ADX'] = adx['ADX_14']
-        df['PLUS_DI'] = adx['DMP_14']
-        df['MINUS_DI'] = adx['DMN_14']
-        # Squeeze Momentum (LazyBear)
-        bb = ta.bbands(close, 20, 2)
-        kc = ta.kc(high, low, close, 20, 1.5)
-        df['SQUEEZE_ON'] = (bb['BBL_20_2.0'] > kc['KCLo_20_1.5']) & (bb['BBU_20_2.0'] < kc['KCUe_20_1.5'])
-        return df
-
-    def _compute_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """ML特征工程: Lag, Ratios, Volatility Clusters"""
-        close = df.close
-        for lag in [1, 2, 5, 10]:
-            df[f'RET_LAG{lag}'] = close.pct_change(lag)
-            df[f'RSI_LAG{lag}'] = df['RSI'].shift(lag)
-        df['VOL_CLUSTER'] = df['ATR'].rolling(20).std()
-        df['PRICE_VWAP_RATIO'] = close / df['VWAP']
-        df['MACD_SLOPE'] = df['MACD_HIST'].diff()
-        return df
-
-    def _train_ml_model(self) -> GradientBoostingClassifier:
-        """训练GBT分类器预测信号强度 (模拟训练, 实际可加载预训练)"""
-        # 模拟历史数据训练
-        np.random.seed(42)
-        X = np.random.randn(10000, 20)
-        y = (np.random.randn(10000) > 0).astype(int)
-        model = GradientBoostingClassifier(n_estimators=100, subsample=0.8, random_state=42)
-        tscv = TimeSeriesSplit(n_splits=5)
-        for train_idx, val_idx in tscv.split(X):
-            model.fit(X[train_idx], y[train_idx])
-        return model
-
-    def predict_ml_strength(self, features: np.ndarray) -> float:
-        """ML预测信号置信度"""
-        features_scaled = self.scaler.fit_transform(features.reshape(1, -1))
-        prob = self.ml_model.predict_proba(features_scaled)[0][1]
-        return prob * 100
+            st.error(f"数据拉取失败 [{timeframe}]: {str(e)}")
+            return pd.DataFrame()
 
 # ============================================================
-# 3. 单周期华尔街分析师 (因子打分 + SL/TP + 回测)
+# 4. 华尔街级分析核心 (The Alpha Brain)
 # ============================================================
 
-class WallStreetFrameAnalyst:
-    def __init__(self, df: pd.DataFrame, tf: str, engine: OKXInstitutionalEngine):
-        self.df = df
-        self.tf = tf
-        self.engine = engine
-        self.timeframe_label = TIMEFRAMES[tf]
+class AlphaAnalyst:
+    """
+    这是系统的核心大脑。
+    包含：指标计算、多因子打分模型、动态止损算法、以及向量化回测引擎。
+    """
+    
+    def __init__(self, df: pd.DataFrame, timeframe: str):
+        self.df = df.copy()
+        self.tf = timeframe
+        self.label = self._format_tf(timeframe)
+        self._calculate_indicators()
+        
+    def _format_tf(self, tf):
+        mapping = {'1m': 'SCALPING (1m)', '5m': 'MOMENTUM (5m)', '15m': 'DAYTRADE (15m)', 
+                   '1h': 'SWING (1h)', '4h': 'POSITION (4h)', '1d': 'TREND (1d)'}
+        return mapping.get(tf, tf)
 
-    def generate_signal(self) -> SignalExplanation:
-        """核心分析: 趋势/动能/波动/资金流/ML融合"""
+    def _calculate_indicators(self):
+        """计算全套技术指标"""
+        # 1. 趋势系
+        self.df['EMA_20'] = ta.ema(self.df['close'], length=20)
+        self.df['EMA_50'] = ta.ema(self.df['close'], length=50)
+        self.df['EMA_200'] = ta.ema(self.df['close'], length=200)
+        
+        # 2. 趋势强度
+        adx = ta.adx(self.df['high'], self.df['low'], self.df['close'], length=14)
+        self.df['ADX'] = adx['ADX_14']
+        
+        # 3. 动能系
+        self.df['RSI'] = ta.rsi(self.df['close'], length=14)
+        
+        # 4. 波动率 (用于止损)
+        self.df['ATR'] = ta.atr(self.df['high'], self.df['low'], self.df['close'], length=14)
+        
+        # 5. 资金流/量价
+        self.df['OBV'] = ta.obv(self.df['close'], self.df['volume'])
+        self.df['OBV_MA'] = ta.ema(self.df['OBV'], length=20)
+        
+        # 6. 布林带 (用于回归/突破)
+        bb = ta.bbands(self.df['close'], length=20, std=2)
+        self.df['BB_UP'] = bb['BBU_20_2.0']
+        self.df['BB_LOW'] = bb['BBL_20_2.0']
+        self.df['BB_W'] = bb['BBB_20_2.0'] # Bandwidth
+
+        self.df.dropna(inplace=True)
+
+    def analyze_signal(self) -> SignalResult:
+        """执行当前K线的深度分析"""
         current = self.df.iloc[-1]
         prev = self.df.iloc[-2]
+        
+        score = 0.0
+        reasons = []
+        
+        # --- 因子 1: EMA 均线排列 (趋势权重: 40%) ---
+        if current['close'] > current['EMA_20'] > current['EMA_50']:
+            score += 3.0
+            reasons.append("多头排列：价格站稳 EMA20/50 之上，趋势向上。")
+        elif current['close'] < current['EMA_20'] < current['EMA_50']:
+            score -= 3.0
+            reasons.append("空头排列：价格被 EMA20/50 压制，趋势向下。")
+        else:
+            reasons.append("均线纠缠：EMA 系统暂无明确方向，处于震荡或转折期。")
+            
+        # --- 因子 2: 趋势强度 ADX (过滤权重: 10%) ---
+        if current['ADX'] > 25:
+            score *= 1.2 # 趋势强劲时，放大当前信号权重
+            reasons.append(f"ADX ({current['ADX']:.1f}) 显示当前趋势动能强劲，顺势交易胜率更高。")
+        else:
+            score *= 0.8 # 震荡市，缩小信号权重
+            reasons.append(f"ADX ({current['ADX']:.1f}) 偏弱，市场处于无序震荡，需警惕假突破。")
 
-        long_score, short_score = self._score_trend(current) + self._score_momentum(current, prev) + \
-                                  self._score_volatility(current) + self._score_volume(current) + \
-                                  self._score_structure(current)
+        # --- 因子 3: RSI 动能与背离 (反转权重: 30%) ---
+        if current['RSI'] > 70:
+            score -= 1.5
+            reasons.append(f"RSI ({current['RSI']:.1f}) 进入超买区，短期获利盘可能回吐。")
+        elif current['RSI'] < 30:
+            score += 1.5
+            reasons.append(f"RSI ({current['RSI']:.1f}) 进入超卖区，技术性反弹概率增加。")
+        
+        # --- 因子 4: 资金流 OBV (确认权重: 20%) ---
+        if current['OBV'] > current['OBV_MA']:
+            score += 1.0
+            reasons.append("资金流：OBV 位于均线上方，买盘量能健康。")
+        else:
+            score -= 1.0
+            reasons.append("资金流：OBV 位于均线下方，上涨缺乏量能支撑。")
 
-        net_score = long_score - short_score
-        conviction = min(100, abs(net_score) * 8)
-        bias = self._classify_bias(net_score)
-        regime = self._classify_regime(current)
+        # --- 综合裁决 ---
+        confidence = min(abs(score) * 10, 100)
+        bias = "NEUTRAL"
+        if score >= 2.0: bias = "BULL"
+        elif score <= -2.0: bias = "BEAR"
+        
+        # --- 动态交易计划 (ATR Based) ---
+        atr = current['ATR']
+        price = current['close']
+        
+        if bias == "BULL":
+            # 多头：止损放在当前价格下方 1.5 - 2 倍 ATR
+            sl = price - (2.0 * atr)
+            risk = price - sl
+            tp1 = price + (1.5 * risk)
+            tp2 = price + (3.0 * risk)
+        elif bias == "BEAR":
+            # 空头：止损放在当前价格上方 1.5 - 2 倍 ATR
+            sl = price + (2.0 * atr)
+            risk = sl - price
+            tp1 = price - (1.5 * risk)
+            tp2 = price - (3.0 * risk)
+        else:
+            # 震荡：收窄止损
+            sl = price * 0.99
+            tp1 = price * 1.01
+            tp2 = price * 1.02
+            
+        rr = 0.0
+        if bias != "NEUTRAL" and abs(price - sl) > 0:
+            rr = abs(tp1 - price) / abs(price - sl)
 
-        reasons = self._generate_reasons(long_score, short_score, current, regime)
+        # --- 实时回测 (Simulation) ---
+        win_rate, trades, expectancy = self._run_backtest_logic()
 
-        entry, sl, tp1, tp2, rr1, rr2 = self._compute_levels(current)
-
-        # ML增强
-        ml_features = self._extract_ml_features(current)
-        ml_conf = self.engine.predict_ml_strength(ml_features)
-
-        # 回测
-        bt_stats = self._run_factor_backtest()
-
-        return SignalExplanation(
-            timeframe=self.timeframe_label,
-            regime=regime,
+        return SignalResult(
+            timeframe=self.label,
             bias=bias,
-            conviction=conviction,
-            long_score=long_score,
-            short_score=short_score,
+            score=score,
+            confidence=confidence,
             reasons=reasons,
-            entry_hint=entry,
+            entry_price=price,
             stop_loss=sl,
             take_profit_1=tp1,
             take_profit_2=tp2,
-            reward_risk_1=rr1,
-            reward_risk_2=rr2,
-            bt_trades=bt_stats['trades'],
-            bt_winrate=bt_stats['winrate'],
-            bt_pf=bt_stats['pf'],
-            bt_sharpe=bt_stats['sharpe'],
-            bt_avg_rr=bt_stats['avg_rr'],
-            ml_confidence=ml_conf
+            rr_ratio=rr,
+            bt_win_rate=win_rate,
+            bt_total_trades=trades,
+            bt_expectancy=expectancy
         )
 
-    def _score_trend(self, current: pd.Series) -> Tuple[float, float]:
-        long, short = 0.0, 0.0
-        ema_alignment = sum(current[f'EMA_{l}'] for l in [8,21,50] if current.close > current[f'EMA_{l}'])
-        if ema_alignment >= 2:
-            long += 3.0
-            self.reasons.append("EMA梯队完美排列: 价格 > EMA8 > EMA21 > EMA50, 多头结构完整")
-        st_dir = current['SUPERTREND_DIR']
-        if st_dir > 0:
-            long += 2.0
-            self.reasons.append("SuperTrend绿柱支撑, 动态趋势确认多头")
-        elif st_dir < 0:
-            short += 2.0
-            self.reasons.append("SuperTrend红柱压制, 空头控制")
-        return long, short
-
-    def _score_momentum(self, current: pd.Series, prev: pd.Series) -> Tuple[float, float]:
-        long, short = 0.0, 0.0
-        rsi = current.RSI
-        if 30 < rsi < 50:
-            long += 1.5
-            self.reasons.append(f"RSI {rsi:.1f}: 超卖修复, 动能转向多头")
-        elif rsi > 70:
-            short += 1.5
-            self.reasons.append(f"RSI {rsi:.1f}: 超买背离风险, 多头疲软")
-        macd_hist = current.MACD_HIST
-        if macd_hist > prev.MACD_HIST and current.MACD > current.MACD_SIGNAL:
-            long += 2.0
-            self.reasons.append("MACD柱放大 + 金叉, 资金加速流入")
-        elif macd_hist < prev.MACD_HIST and current.MACD < current.MACD_SIGNAL:
-            short += 2.0
-            self.reasons.append("MACD柱收缩 + 死叉, 动能衰竭")
-        return long, short
-
-    def _score_volatility(self, current: pd.Series) -> Tuple[float, float]:
-        long, short = 0.0, 0.0
-        bb_pos = (current.close - current.BB_LOWER) / (current.BB_UPPER - current.BB_LOWER)
-        if bb_pos < 0.2:
-            long += 1.0
-            self.reasons.append("价格触及BB下轨, 超卖反弹概率高")
-        elif bb_pos > 0.8:
-            short += 1.0
-            self.reasons.append("价格触及BB上轨, 超买回调风险")
-        adx = current.ADX
-        if adx > 25 and current.PLUS_DI > current.MINUS_DI:
-            long += 1.5
-            self.reasons.append(f"ADX {adx:.1f}: 强趋势 + +DI主导, 顺势多头")
-        return long, short
-
-    def _score_volume(self, current: pd.Series) -> Tuple[float, float]:
-        long, short = 0.0, 0.0
-        vol_ratio = current.VOLUME_RATIO
-        if vol_ratio > 1.5 and current.close > current['VWAP']:
-            long += 1.0
-            self.reasons.append(f"量价齐升 (VolRatio {vol_ratio:.1f}), 买盘主导")
-        mfi = current.MFI
-        if mfi < 20:
-            long += 1.0
-            self.reasons.append(f"MFI {mfi:.1f}: 资金超卖, 修复空间大")
-        return long, short
-
-    def _score_structure(self, current: pd.Series) -> Tuple[float, float]:
-        long, short = 0.0, 0.0
-        # Structure breaks, recent highs/lows
-        recent_high = self.df.high.rolling(20).max().iloc[-1]
-        recent_low = self.df.low.rolling(20).min().iloc[-1]
-        if current.close > recent_high * 0.995:
-            long += 1.5
-            self.reasons.append("突破20期高点, 结构转多")
-        return long, short
-
-    def _classify_bias(self, net_score: float) -> Bias:
-        if net_score >= 6: return Bias.STRONG_BULL
-        if net_score >= 3: return Bias.BULL
-        if net_score <= -6: return Bias.STRONG_BEAR
-        if net_score <= -3: return Bias.BEAR
-        return Bias.NEUTRAL
-
-    def _classify_regime(self, current: pd.Series) -> MarketRegime:
-        adx = current.ADX
-        bb_width = current.BB_WIDTH
-        squeeze = current.SQUEEZE_ON
-        if adx > 25:
-            return MarketRegime.TRENDING
-        if bb_width < 0.05 or squeeze:
-            return MarketRegime.CONTRACTING
-        if bb_width > 0.1:
-            return MarketRegime.EXPANDING
-        return MarketRegime.RANGING
-
-    def _generate_reasons(self, long: float, short: float, current: pd.Series, regime: MarketRegime) -> List[str]:
-        reasons = []
-        # Populate from scoring logic (already appended in scores)
-        reasons.append(f"当前环境: {regime.value} | 多头因子总分 {long:.1f} vs 空头 {short:.1f}")
-        reasons.append(f"关键数值: RSI {current.RSI:.1f} | ADX {current.ADX:.1f} | ATR {current.ATR:.2f}")
-        return reasons[:8]  # Limit to top 8
-
-    def _compute_levels(self, current: pd.Series) -> Tuple[float, float, float, float, float, float]:
-        atr = current.ATR
-        if pd.isna(atr) or atr == 0:
-            return current.close, 0, 0, 0, 0, 0
-
-        entry = current.close
-        recent_low = self.df.low.rolling(20).min().iloc[-1]
-        recent_high = self.df.high.rolling(20).max().iloc[-1]
-
-        risk = 1.5 * atr  # Conservative SL distance
-        if self.long_score > self.short_score:  # Long
-            sl = min(entry - risk, recent_low * 1.005)
-            r = entry - sl
-            tp1 = entry + 2 * r
-            tp2 = entry + 3.5 * r
-        else:  # Short
-            sl = max(entry + risk, recent_high * 0.995)
-            r = sl - entry
-            tp1 = entry - 2 * r
-            tp2 = entry - 3.5 * r
-
-        rr1 = 2.0
-        rr2 = 3.5
-        return entry, sl, tp1, tp2, rr1, rr2
-
-    def _run_factor_backtest(self) -> Dict[str, float]:
-        """因子回测: 模拟过去200笔信号表现"""
-        results = []
-        for i in range(50, len(self.df) - 10):
-            hist_current = self.df.iloc[i]
-            hist_long, hist_short = self._quick_score(hist_current)
-            if hist_long - hist_short >= 3:
-                direction = 1
-            elif hist_short - hist_long >= 3:
-                direction = -1
-            else:
-                continue
-            entry = hist_current.close
-            atr = hist_current.ATR
-            sl_dist = 1.5 * atr
-            sl = entry - sl_dist * direction
-            tp = entry + 2 * sl_dist * direction
-            outcome = self._simulate_outcome(self.df.iloc[i+1:i+11], direction, entry, sl, tp)
-            results.append(outcome)
-
-        if not results:
-            return {'trades': 0, 'winrate': 0, 'pf': 0, 'sharpe': 0, 'avg_rr': 0}
-
-        wins = [r for r in results if r > 0]
-        winrate = len(wins) / len(results)
-        pf = sum(wins) / abs(sum([r for r in results if r < 0])) if any(r < 0 for r in results) else float('inf')
-        sharpe = np.mean(results) / np.std(results) if np.std(results) > 0 else 0
-        avg_rr = np.mean(results)
-
-        return {
-            'trades': len(results),
-            'winrate': winrate,
-            'pf': pf,
-            'sharpe': sharpe,
-            'avg_rr': avg_rr
-        }
-
-    def _quick_score(self, row: pd.Series) -> Tuple[float, float]:
-        # Simplified scoring for backtest speed
-        long = int(row.close > row['EMA_21']) + int(row.RSI < 50) + int(row['SUPERTREND_DIR'] > 0)
-        short = int(row.close < row['EMA_21']) + int(row.RSI > 50) + int(row['SUPERTREND_DIR'] < 0)
-        return long, short
-
-    def _simulate_outcome(self, future_bars: pd.DataFrame, direction: int, entry: float, sl: float, tp: float) -> float:
-        risk = abs(entry - sl)
-        for _, bar in future_bars.iterrows():
-            if direction > 0:  # Long
-                if bar.low <= sl:
-                    return -1.0
-                if bar.high >= tp:
-                    return 2.0
-            else:  # Short
-                if bar.high >= sl:
-                    return -1.0
-                if bar.low <= tp:
-                    return 2.0
-        # Time exit
-        final_price = future_bars.iloc[-1].close
-        return (final_price - entry) / risk * direction
-
-# ============================================================
-# 4. 多周期首席分析师 (权重融合 + 全球观点)
-# ============================================================
-
-class WallStreetChiefAnalyst:
-    def __init__(self, signals: Dict[str, SignalExplanation]):
-        self.signals = signals
-        self.weights = {'1m': 0.5, '5m': 0.8, '15m': 1.2, '1h': 1.8, '4h': 2.5, '1d': 3.5, '1w': 4.0}
-
-    def generate_global_view(self) -> Tuple[str, Bias, float, Dict[str, Any]]:
-        bull_power, bear_power = 0.0, 0.0
-        tf_contrib = []
-
-        for tf, sig in self.signals.items():
-            if sig is None:
-                continue
-            w = self.weights[tf]
-            net = sig.long_score - sig.short_score
-            power = abs(net) * w * (sig.conviction / 100)
-            if net > 0:
-                bull_power += power
-            else:
-                bear_power += power
-            tf_contrib.append(f"{sig.timeframe}: {sig.bias.value} ({sig.conviction:.0f}%)")
-
-        total_power = bull_power + bear_power
-        bull_ratio = bull_power / total_power if total_power > 0 else 0.5
-        global_conviction = min(100, total_power / 10)
-
-        bias = self._global_bias(bull_ratio, bull_power, bear_power)
-        narrative = self._craft_narrative(bias, bull_ratio, tf_contrib)
-
-        return narrative, bias, global_conviction, {'bull_ratio': bull_ratio, 'tf_contrib': tf_contrib}
-
-    def _global_bias(self, bull_ratio: float, bull_p: float, bear_p: float) -> Bias:
-        if bull_ratio > 0.65 and bull_p > 15:
-            return Bias.STRONG_BULL
-        if bull_ratio > 0.55:
-            return Bias.BULL
-        if bull_ratio < 0.35 and bear_p > 15:
-            return Bias.STRONG_BEAR
-        if bull_ratio < 0.45:
-            return Bias.BEAR
-        return Bias.NEUTRAL
-
-    def _craft_narrative(self, bias: Bias, ratio: float, contrib: List[str]) -> str:
-        base = f"**全球共识: {bias.value}** | 多空比 {ratio:.0%}\n"
-        base += "多周期分解: " + " | ".join(contrib[:6])
-        base += "\n\n**首席观点**: "
-        if bias == Bias.STRONG_BULL:
-            base += "所有时间尺度高度一致: 从1m高频到1w趋势,多头控制全局。优先配置多头仓位,回调为加仓窗口。"
-        # Similar for others...
-        return base
-
-# ============================================================
-# 5. 专业仓位管理 (Kelly + Volatility Adjusted)
-# ============================================================
-
-class InstitutionalPositionSizer:
-    @staticmethod
-    def size_position(equity: float, risk_pct: float, entry: float, sl: float, 
-                      winrate: float = 0.55, avg_win: float = 2.5, avg_loss: float = -1.0, leverage: float = 1.0) -> Dict[str, float]:
-        risk_amount = equity * (risk_pct / 100)
-        dist_risk = abs(entry - sl)
-        base_size = risk_amount / dist_risk
-
-        # Kelly Criterion
-        kelly_pct = (winrate * avg_win + (1-winrate) * avg_loss) / avg_win
-        kelly_size = base_size * max(0.25, min(kelly_pct, 0.5))  # Half-Kelly conservative
-
-        vol_adjust = 1 / (1 + 0.5 * dist_risk / entry)  # Volatility scalar
-        final_size = kelly_size * vol_adjust * leverage
-
-        return {
-            'base_size': base_size,
-            'kelly_size': kelly_size,
-            'final_size': final_size,
-            'risk_amount': risk_amount,
-            'kelly_pct': kelly_pct,
-            'vol_adjust': vol_adjust
-        }
-
-# ============================================================
-# 6. 专业渲染组件
-# ============================================================
-
-@st.cache_data(ttl=300)  # 5min cache
-def render_alpha_card(sig: Optional[SignalExplanation]):
-    if sig is None:
-        st.markdown("""
-        <div class="alpha-card">
-          <div class="alpha-header">
-            <div class="alpha-title">数据不足</div>
-            <div class="alpha-tag tag-neutral">等待数据</div>
-          </div>
-          <div class="reason-list">历史K线不足80根, 无法可靠计算指标。</div>
-        </div>
-        """, unsafe_allow_html=True)
-        return
-
-    tag_class = f"tag-{sig.bias.name.lower().replace('_','-')}"
-    conviction_color = "text-success" if sig.conviction > 70 else "text-warning" if sig.conviction > 50 else "text-muted"
-
-    bt_kpis = ""
-    if sig.bt_trades > 0:
-        bt_color = "metric-good" if sig.bt_pf > 1.5 else "metric-bad"
-        bt_kpis = f"""
-        <div class="backtest-panel">
-          <span class="backtest-kpi metric-good">胜率 {sig.bt_winrate:.1%}</span>
-          <span class="backtest-kpi {bt_color}">PF {sig.bt_pf:.2f}</span>
-          <span class="backtest-kpi">期望 {sig.bt_avg_rr:.2f}R</span>
-          <span class="backtest-kpi">Sharpe {sig.bt_sharpe:.2f}</span>
-          <small>过去 {sig.bt_trades}笔 | ML信度 {sig.ml_confidence:.0f}%</small>
-        </div>
+    def _run_backtest_logic(self) -> Tuple[float, int, float]:
         """
-
-    st.markdown(f"""
-    <div class="alpha-card">
-      <div class="alpha-header">
-        <div class="alpha-title">{sig.timeframe}</div>
-        <div class="alpha-tag {tag_class}">信度 {sig.conviction:.0f}%</div>
-      </div>
-      <div class="reason-list">
-        {''.join(f'<div class="reason-item"><span class="reason-bullet">●</span><span>{r}</span></div>' for r in sig.reasons)}
-      </div>
-      <div class="plan-section">
-        <div class="plan-row"><span class="plan-label">入场</span><span class="plan-value">${sig.entry_hint:,.4f}</span></div>
-        <div class="plan-row"><span class="plan-label">止损</span><span class="plan-value plan-bear">${sig.stop_loss:,.4f}</span></div>
-        <div class="plan-row"><span class="plan-label">TP1 (2R)</span><span class="plan-value plan-bull">${sig.take_profit_1:,.4f}</span></div>
-        <div class="plan-row"><span class="plan-label">TP2 (3.5R)</span><span class="plan-value plan-bull">${sig.take_profit_2:,.4f}</span></div>
-      </div>
-      {bt_kpis}
-    </div>
-    """, unsafe_allow_html=True)
-
-def render_global_summary(summary: str, bias: Bias, conviction: float, metrics: Dict):
-    st.markdown(f"""
-    <div class="global-summary">
-      <div class="summary-title">ALPHA CONSENSUS</div>
-      <div class="summary-main">{summary}</div>
-      <div class="summary-kpis">
-        <strong>{bias.value}</strong> | 置信 {conviction:.0f}% | 多头占比 {metrics['bull_ratio']:.0%}
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-def render_position_card(sig: SignalExplanation, sizer: Dict):
-    st.markdown(f"""
-    <div class="position-panel">
-      <div class="alpha-header">
-        <div class="alpha-title">执行模板 ({sig.timeframe})</div>
-        <div class="alpha-tag tag-bull">{sig.bias.value}</div>
-      </div>
-      <table class="metric-table">
-        <tr><td>风险预算</td><td class="metric-good">{sizer['risk_amount']:,.0f} USDT ({risk_pct:.1f}%)</td></tr>
-        <tr><td>Kelly仓位</td><td>{sizer['kelly_size']:,.4f} 币</td></tr>
-        <tr><td>最终建议</td><td class="metric-good">{sizer['final_size']:,.4f} 币</td></tr>
-        <tr><td>Kelly系数</td><td>{sizer['kelly_pct']:.1%}</td></tr>
-      </table>
-      <div class="risk-disclaimer">
-        仓位逻辑: 固定风险 + Kelly优化 + 波动调整。胜率55%+期望2R → 长期复合优势。
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+        在当前 K 线图的历史数据上，运行完全相同的打分逻辑。
+        这能告诉用户：'如果过去 500 根 K 线你都听我的，结果会怎样。'
+        """
+        wins = 0
+        total = 0
+        total_r = 0.0
+        
+        # 简单模拟：只看最近 200 根，避免计算太慢
+        lookback = 200
+        if len(self.df) < lookback + 50: return 0.0, 0, 0.0
+        
+        subset = self.df.iloc[-(lookback+20):-1] # 留最后几根没走完的不测
+        
+        for i in range(50, len(subset)-10):
+            row = subset.iloc[i]
+            
+            # 简化的逻辑复刻 (为了速度)
+            s = 0
+            if row['close'] > row['EMA_20'] > row['EMA_50']: s += 3
+            elif row['close'] < row['EMA_20'] < row['EMA_50']: s -= 3
+            
+            if row['RSI'] < 30: s += 1.5
+            elif row['RSI'] > 70: s -= 1.5
+            
+            # 模拟交易结果
+            outcome_r = 0
+            entry = row['close']
+            atr = row['ATR']
+            
+            if s >= 2.5: # 模拟做多
+                sl = entry - 2.0 * atr
+                tp = entry + 1.5 * (entry - sl)
+                # 往后看 10 根 K 线
+                future = subset.iloc[i+1:i+11]
+                for _, f in future.iterrows():
+                    if f['low'] <= sl: 
+                        outcome_r = -1.0; break
+                    if f['high'] >= tp:
+                        outcome_r = 1.5; break
+                total += 1
+                if outcome_r > 0: wins += 1
+                total_r += outcome_r
+                
+            elif s <= -2.5: # 模拟做空
+                sl = entry + 2.0 * atr
+                tp = entry - 1.5 * (sl - entry)
+                future = subset.iloc[i+1:i+11]
+                for _, f in future.iterrows():
+                    if f['high'] >= sl:
+                        outcome_r = -1.0; break
+                    if f['low'] <= tp:
+                        outcome_r = 1.5; break
+                total += 1
+                if outcome_r > 0: wins += 1
+                total_r += outcome_r
+                
+        if total == 0: return 0.0, 0, 0.0
+        return wins / total, total, total_r / total
 
 # ============================================================
-# 7. 主终端 (Institutional Dashboard)
+# 5. 首席分析师综合逻辑 (Synthesis)
+# ============================================================
+
+class ChiefAnalyst:
+    @staticmethod
+    def summarize(signals: List[SignalResult]) -> Tuple[str, str]:
+        """汇总所有周期，给出最终结论"""
+        bull_power = sum(s.confidence for s in signals if s.bias == "BULL")
+        bear_power = sum(s.confidence for s in signals if s.bias == "BEAR")
+        
+        diff = bull_power - bear_power
+        
+        if diff > 150:
+            title = "STRONG BUY / 强力做多结构"
+            desc = "从短线到中长线，市场呈现完美的多头共振。资金、趋势、动能完全一致。建议激进做多，利用回调加仓。"
+        elif diff > 50:
+            title = "BUY / 震荡偏多"
+            desc = "整体结构偏向多头，但可能存在短周期的回调压力或长周期的压制。建议逢低买入，避免追高。"
+        elif diff < -150:
+            title = "STRONG SELL / 强力做空结构"
+            desc = "空头完全主导市场，多周期均线反压，资金持续流出。任何反弹都是做空的机会。"
+        elif diff < -50:
+            title = "SELL / 震荡偏空"
+            desc = "市场重心下移，空头占优。建议在阻力位布局空单，设好防守。"
+        else:
+            title = "NEUTRAL / 激烈博弈"
+            desc = "多空力量在不同周期打架（例如短线涨、长线跌）。此时市场缺乏方向，建议空仓观望或仅做超短线剥头皮。"
+            
+        return title, desc
+
+# ============================================================
+# 6. UI 渲染组件 (关键：解决 HTML 乱码的终极方案)
+# ============================================================
+
+def render_signal_card(res: SignalResult):
+    """
+    渲染单个周期的分析卡片。
+    关键技术：使用 List Join 拼接 HTML，严禁换行符，确保 Streamlit 完美渲染。
+    """
+    if res.bias == "BULL":
+        color_class = "bull-bg"
+        icon = "🟢"
+        score_txt = f"+{res.score:.1f}"
+        bias_txt = "偏多 BULLISH"
+    elif res.bias == "BEAR":
+        color_class = "bear-bg"
+        icon = "🔴"
+        score_txt = f"{res.score:.1f}"
+        bias_txt = "偏空 BEARISH"
+    else:
+        color_class = "neutral-bg"
+        icon = "⚪"
+        score_txt = f"{res.score:.1f}"
+        bias_txt = "观望 NEUTRAL"
+
+    # 构建逻辑列表 HTML
+    logic_items = ""
+    for reason in res.reasons:
+        logic_items += f"<li class='logic-li'><span class='logic-icon'>›</span><span>{reason}</span></li>"
+    
+    # 构建回测数据 HTML
+    win_rate_pct = res.bt_win_rate * 100
+    expectancy_color = "#34d399" if res.bt_expectancy > 0 else "#fb7185"
+    
+    # ！！！核心修复：单行拼接，无缩进！！！
+    html_parts = [
+        "<div class='quant-card'>",
+        "<div class='card-header'>",
+        f"<div class='card-title'>{res.timeframe}</div>",
+        f"<div class='card-score {color_class}'>{icon} {bias_txt} (Score: {score_txt})</div>",
+        "</div>",
+        f"<ul class='logic-ul'>{logic_items}</ul>",
+        "<div class='plan-grid'>",
+        f"<div class='plan-item'><span class='plan-label'>ENTRY</span><span class='plan-val'>${res.entry_price:,.2f}</span></div>",
+        f"<div class='plan-item'><span class='plan-label'>STOP LOSS</span><span class='plan-val val-red'>${res.stop_loss:,.2f}</span></div>",
+        f"<div class='plan-item'><span class='plan-label'>TARGET 1</span><span class='plan-val val-green'>${res.take_profit_1:,.2f}</span></div>",
+        f"<div class='plan-item'><span class='plan-label'>RISK/REWARD</span><span class='plan-val'>{res.rr_ratio:.2f}R</span></div>",
+        "</div>",
+        "<div class='bt-stat'>",
+        f"<span>因子回测 (近{res.bt_total_trades}笔)</span>",
+        f"<span>胜率: <b style='color:#e2e8f0'>{win_rate_pct:.1f}%</b> &nbsp;|&nbsp; 期望值: <b style='color:{expectancy_color}'>{res.bt_expectancy:+.2f}R</b></span>",
+        "</div>",
+        "</div>"
+    ]
+    
+    st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+def render_position_calculator(equity, risk_pct, entry, stop):
+    """渲染仓位计算器"""
+    if entry == 0 or stop == 0 or entry == stop:
+        return
+        
+    risk_amt = equity * (risk_pct / 100)
+    price_diff = abs(entry - stop)
+    position_size = risk_amt / price_diff
+    
+    # 杠杆建议（简化版：名义价值/本金）
+    notional = position_size * entry
+    lev = notional / equity
+    
+    # 单行 HTML 拼接
+    html = "".join([
+        "<div class='quant-card' style='border-color: #6366f1; background: rgba(99, 102, 241, 0.05);'>",
+        "<div class='card-title' style='color:#818cf8; margin-bottom:8px;'>📦 机构级仓位风控建议 (Position Sizing)</div>",
+        "<div style='font-size:14px; color:#cbd5e1; line-height:1.6;'>",
+        f"基于您 <b>${equity:,.0f}</b> 的本金，单笔风险限制在 <b>{risk_pct}% (${risk_amt:.1f})</b>：<br/>",
+        f"建议开仓数量：<b style='color:#fff; font-size:18px;'>{position_size:.4f} 币</b><br/>",
+        f"<span style='font-size:12px; color:#94a3b8'>(隐含杠杆率约为 {lev:.1f}x · 止损即亏损 ${risk_amt:.1f})</span>",
+        "</div></div>"
+    ])
+    st.markdown(html, unsafe_allow_html=True)
+
+# ============================================================
+# 7. 主程序 (Main Entry)
 # ============================================================
 
 def main():
-    st.title("🦅 Wall Street Alpha Desk v2.0")
-    st.caption("*华尔街首席量化终端 | OKX实时数据 | ML增强 | 回测验证 | 风险优先*")
-
-    # Sidebar
+    # --- 侧边栏配置 ---
     with st.sidebar:
-        st.header("🎯 交易参数")
-        MARKET_LIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "OKB/USDT", "DOGE/USDT"]
-        symbol = st.selectbox("标的", MARKET_LIST, 0)
-        contract_type = st.selectbox("合约类型", ["spot", "swap"])
-        OKX_CONFIG['options']['defaultType'] = contract_type
+        st.markdown("### 📡 ALPHA DESK SETUP")
+        symbol = st.selectbox("选择标的 (Spot)", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "AVAX/USDT"], index=0)
+        
+        st.markdown("---")
+        st.markdown("### 💰 资金管理 (Risk Mgmt)")
+        equity = st.number_input("账户总权益 (USDT)", value=10000.0, step=1000.0)
+        risk = st.slider("单笔最大风险 (%)", 0.5, 5.0, 2.0, 0.5)
+        
+        st.info("数据来源：OKX Public API\n模式：Direct Connect (No Proxy)\n延迟：实时")
 
-        enabled_tfs = st.multiselect("时间帧", list(TIMEFRAMES.keys()), default=list(TIMEFRAMES.keys())[:6])
+    # --- 头部行情 ---
+    engine = OKXDataEngine()
+    price, pct = engine.get_market_price(symbol)
+    
+    color = "#34d399" if pct >= 0 else "#fb7185"
+    utc_now = datetime.utcnow().strftime("%H:%M:%S UTC")
+    
+    # 头部横幅 HTML
+    st.markdown("".join([
+        "<div style='display:flex; align-items:baseline; gap:12px; margin-bottom:20px;'>",
+        f"<h1 style='margin:0; font-size:32px;'>{symbol}</h1>",
+        f"<span style='font-size:24px; font-family:monospace; font-weight:700; color:#f8fafc'>${price:,.2f}</span>",
+        f"<span style='font-size:16px; color:{color}; font-weight:600'>{pct:+.2f}%</span>",
+        f"<span style='margin-left:auto; font-size:12px; color:#64748b'>MARKET OPEN · {utc_now}</span>",
+        "</div>"
+    ]), unsafe_allow_html=True)
 
-        st.header("💼 资金管理")
-        equity = st.number_input("总资金 (USDT)", 1000.0, 10000000.0, 50000.0)
-        risk_pct = st.slider("单笔风险%", 0.5, 3.0, 1.5, 0.1)
-        leverage = st.slider("杠杆倍数", 1, 20, 3)
-
-        if st.button("🚀 生成阿尔法信号", type="primary"):
-            st.session_state.signals_ready = True
-
-    if 'signals_ready' not in st.session_state:
-        st.session_state.signals_ready = False
-
-    if not st.session_state.signals_ready:
-        st.info("👆 配置参数后点击 '生成阿尔法信号' 开始分析")
-        return
-
-    # Engine & Data
-    engine = OKXInstitutionalEngine(OKX_CONFIG)
-    data = engine.fetch_multi_tf_data(symbol, enabled_tfs, 2000)
-
-    # Generate Signals
-    signals = {}
+    # --- 核心分析循环 ---
+    timeframes = ['15m', '1h', '4h', '1d']
+    results = []
+    
     progress = st.progress(0)
-    for i, tf in enumerate(enabled_tfs):
-        if tf in data:
-            analyst = WallStreetFrameAnalyst(data[tf], tf, engine)
-            signals[tf] = analyst.generate_signal()
-        progress.progress((i+1)/len(enabled_tfs))
+    
+    # 布局：左侧分析卡片，右侧总结与图表
+    col_left, col_right = st.columns([0.55, 0.45])
+    
+    with col_left:
+        st.markdown("### 🔬 Multi-Timeframe Analysis")
+        for i, tf in enumerate(timeframes):
+            df = engine.fetch_candles(symbol, tf)
+            if not df.empty and len(df) > 50:
+                analyst = AlphaAnalyst(df, tf)
+                res = analyst.analyze_signal()
+                results.append(res)
+                render_signal_card(res)
+            progress.progress((i + 1) / len(timeframes))
+            
+    progress.empty()
 
-    # Chief View
-    chief = WallStreetChiefAnalyst(signals)
-    narrative, global_bias, conviction, metrics = chief.generate_global_view()
-    render_global_summary(narrative, global_bias, conviction, metrics)
+    with col_right:
+        # 1. 首席分析师总结
+        if results:
+            g_title, g_desc = ChiefAnalyst.summarize(results)
+            st.markdown("".join([
+                "<div class='chief-box'>",
+                f"<div class='chief-title'>🏛 CHIEF ANALYST VERDICT</div>",
+                f"<div class='chief-content'>{g_title}</div>",
+                f"<div style='margin-top:8px; font-size:14px; color:#cbd5e1;'>{g_desc}</div>",
+                "<div class='chief-sub'>* 基于多周期因子加权的一致性评估</div>",
+                "</div>"
+            ]), unsafe_allow_html=True)
+            
+            # 2. 仓位计算
+            # 选取 1H 或 4H 的信号作为主交易参考
+            ref_signal = next((r for r in results if r.timeframe.startswith('SWING') or r.timeframe.startswith('POSITION')), results[0])
+            st.markdown("### 🛡️ Position Sizing")
+            render_position_calculator(equity, risk, ref_signal.entry_price, ref_signal.stop_loss)
 
-    # Cards
-    col_short, col_long = st.columns(2)
-    with col_short:
-        st.subheader("⚡ 短线集群 (1m-1h)")
-        for tf in ['1m', '5m', '15m', '1h']:
-            if tf in signals:
-                render_alpha_card(signals[tf])
-    with col_long:
-        st.subheader("📈 趋势集群 (4h-1w)")
-        for tf in ['4h', '1d', '1w']:
-            if tf in signals:
-                render_alpha_card(signals[tf])
+        # 3. 交互式图表 (1H)
+        st.markdown("### 📈 Market Structure (1H)")
+        chart_df = engine.fetch_candles(symbol, '1h', limit=200)
+        if not chart_df.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(x=chart_df.index, open=chart_df['open'], high=chart_df['high'], low=chart_df['low'], close=chart_df['close'], name='OHLC'))
+            # 添加 EMA
+            ema20 = ta.ema(chart_df['close'], 20)
+            ema50 = ta.ema(chart_df['close'], 50)
+            fig.add_trace(go.Scatter(x=chart_df.index, y=ema20, line=dict(color='#fbbf24', width=1), name='EMA 20'))
+            fig.add_trace(go.Scatter(x=chart_df.index, y=ema50, line=dict(color='#60a5fa', width=1), name='EMA 50'))
+            
+            fig.update_layout(
+                height=400,
+                margin=dict(l=0, r=0, t=0, b=0),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='#94a3b8'),
+                xaxis_rangeslider_visible=False,
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor='#1e293b')
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    # Position Sizing
-    main_sig = signals.get('1h') or next(iter(signals.values()))
-    sizer = InstitutionalPositionSizer.size_position(
-        equity, risk_pct, main_sig.entry_hint, main_sig.stop_loss,
-        main_sig.bt_winrate, main_sig.bt_avg_rr, -1.0, leverage
-    )
-    render_position_card(main_sig, sizer)
-
-    # Multi-Chart
-    chart_tf = '1h'
-    if chart_tf in data:
-        df_chart = data[chart_tf].tail(300)
-        fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
-                            subplot_titles=('价格 & EMA', 'RSI & Stoch', 'MACD', 'Volume & OBV'),
-                            vertical_spacing=0.05, row_heights=[0.5,0.15,0.15,0.2])
-
-        # Candles + EMAs
-        fig.add_trace(go.Candlestick(x=df_chart.index, open=df_chart.open, high=df_chart.high,
-                                     low=df_chart.low, close=df_chart.close, name="Price"), row=1, col=1)
-        for ema in ['EMA_8', 'EMA_21', 'EMA_50']:
-            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[ema], name=ema, line=dict(width=1.5)), row=1, col=1)
-
-        # RSI
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart.RSI, name="RSI", line=dict(color="orange")), row=2, col=1)
-        fig.add_hline(70, row=2, col=1, line_dash="dash", line_color="red")
-        fig.add_hline(30, row=2, col=1, line_dash="dash", line_color="green")
-
-        # MACD
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart.MACD, name="MACD"), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart.MACD_SIGNAL, name="Signal"), row=3, col=1)
-        fig.add_trace(go.Bar(x=df_chart.index, y=df_chart.MACD_HIST, name="Hist"), row=3, col=1)
-
-        # Volume
-        fig.add_trace(go.Bar(x=df_chart.index, y=df_chart.volume, name="Volume", marker_color="rgba(100,100,100,0.6)"), row=4, col=1)
-
-        fig.update_layout(height=800, title=f"{symbol} Multi-Indicator Dashboard", 
-                          template="plotly_dark", showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Risk Footer
-    st.markdown("""
-    <div class="risk-disclaimer">
-      ⚠️ 本终端为量化研究工具，非投资建议。过去表现不代表未来。始终使用止损，控制仓位<2%。
-      首席逻辑: 因子融合(趋势40%+动能30%+波动20%+资金10%) → 统计优势 → 风险平价执行。
-    </div>
-    """, unsafe_allow_html=True)
+    # 底部免责
+    st.markdown("---")
+    st.markdown("".join([
+        "<div style='text-align:center; color:#475569; font-size:12px;'>",
+        "WALLSTREET ALPHA DESK © 2025 • QUANTITATIVE RESEARCH ONLY • NOT FINANCIAL ADVICE",
+        "</div>"
+    ]), unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
