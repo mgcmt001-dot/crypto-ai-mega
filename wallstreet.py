@@ -933,4 +933,72 @@ def main():
     df_chart = data_cache.get(chart_tf)
     if df_chart is not None:
         dff = df_chart.tail(200)
-      
+        fig = go.Figure()
+        fig.add_trace(
+            go.Candlestick(
+                x=dff.index,
+                open=dff["open"],
+                high=dff["high"],
+                low=dff["low"],
+                close=dff["close"],
+                increasing_line_color="#4ade80",
+                decreasing_line_color="#fb7185",
+                name="Price",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dff.index,
+                y=dff["EMA_20"],
+                line=dict(color="#60a5fa", width=1.3),
+                name="EMA 20",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dff.index,
+                y=dff["EMA_50"],
+                line=dict(color="#fbbf24", width=1.1),
+                name="EMA 50",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dff.index,
+                y=dff["EMA_200"],
+                line=dict(color="#9ca3af", width=1.0, dash="dot"),
+                name="EMA 200",
+            )
+        )
+        fig.update_layout(
+            template="plotly_dark",
+            height=420,
+            margin=dict(l=10, r=10, t=30, b=20),
+            paper_bgcolor="rgba(5,7,17,1)",
+            plot_bgcolor="rgba(5,7,17,1)",
+            xaxis_rangeslider_visible=False,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+            ),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(
+        """
+<div class="risk-note">
+这个终端的意义，不是替你做决定，而是把<b>专业交易员的思考路径</b>摆在你面前：<br/>
+趋势、动能、波动率、资金流、多周期、风险预算……<br/>
+当你开始用这些东西来约束自己，而不是用情绪来驱动仓位时，<br/>
+你就已经在向“首席分析师”的那一侧靠近了。
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
