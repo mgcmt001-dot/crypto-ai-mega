@@ -1,936 +1,787 @@
-import math
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
 import streamlit as st
-import ccxt
+import requests
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+from math import floor
+
+# =============================
+# Streamlit 基本设置
+# =============================
+st.set_page_config(
+    page_title="OKX 多因子量化终端",
+    layout="wide"
+)
+
+st.title("OKX 多因子多周期量化分析终端")
+st.caption("⚠️ 本工具仅用于量化研究与教育，不构成任何投资建议。加密资产高风险，请谨慎使用杠杆。")
+
+# =============================
+# OKX 数据抓取部分
+# =============================
+BASE_URL = "https://www.okx.com"
 
 
-# ============================================================
-# 0. 全局配置：OKX（无代理）
-# ============================================================
-
-EXCHANGE_ID = "okx"
-
-OKX_CONFIG = {
-    "enableRateLimit": True,
-    "timeout": 20000,
-    "options": {
-        # 你也可以改成 "swap" 用永续合约
-        "defaultType": "spot",
-    },
-}
-
-
-# ============================================================
-# 1. 数据结构
-# ============================================================
-
-TF_LABELS = {
-    "1m": "超短线 / 剥头皮 (1m)",
-    "5m": "超短线 / 高频 (5m)",
-    "15m": "短线 / 日内驱动 (15m)",
-    "1h": "中线 / 短波段 (1h)",
-    "4h": "波段 (4h)",
-    "1d": "趋势级别 (1d)",
-}
-
-
-@dataclass
-class SignalExplanation:
-    timeframe: str
-    regime: str
-    bias: str              # “偏多 / 偏空 / 震荡 / 观望”
-    conviction: float      # 0–100
-    long_score: float
-    short_score: float
-    reasons: List[str] = field(default_factory=list)
-
-    entry_hint: Optional[float] = None
-    stop_loss: Optional[float] = None
-    take_profit_1: Optional[float] = None
-    take_profit_2: Optional[float] = None
-    reward_risk_1: Optional[float] = None
-    reward_risk_2: Optional[float] = None
-
-    bt_trades: int = 0
-    bt_winrate: Optional[float] = None
-    bt_avg_rr: Optional[float] = None
-
-
-# ============================================================
-# 2. 数据引擎：OKX + 指标
-# ============================================================
-
-class OKXDataEngine:
-    def __init__(self, config: Dict):
-        exchange_class = getattr(ccxt, EXCHANGE_ID)
-        self.exchange = exchange_class(config)
-
-    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 800) -> Optional[pd.DataFrame]:
-        """
-        从 OKX 拉取 K 线数据，并计算一整套技术指标。
-        """
-        try:
-            raw = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            st.error(f"从 OKX 获取 {symbol} {timeframe} 数据失败: {e}")
-            return None
-
-        if not raw:
-            return None
-
-        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df.set_index("timestamp", inplace=True)
-
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-        vol = df["volume"]
-
-        # --- 均线体系 ---
-        df["EMA_10"] = ta.ema(close, length=10)
-        df["EMA_20"] = ta.ema(close, length=20)
-        df["EMA_50"] = ta.ema(close, length=50)
-        df["EMA_100"] = ta.ema(close, length=100)
-        df["EMA_200"] = ta.ema(close, length=200)
-        df["SMA_20"] = ta.sma(close, length=20)
-        df["SMA_50"] = ta.sma(close, length=50)
-
-        # --- 振荡 & 动能 ---
-        df["RSI_14"] = ta.rsi(close, length=14)
-
-        stoch = ta.stoch(high, low, close, k=14, d=3)
-        if stoch is not None and not stoch.empty:
-            df["STOCH_K"] = stoch.iloc[:, 0]
-            df["STOCH_D"] = stoch.iloc[:, 1]
-
-        stoch_rsi = ta.stochrsi(close, length=14)
-        if stoch_rsi is not None and not stoch_rsi.empty:
-            df["STOCHRSI_K"] = stoch_rsi.iloc[:, 0]
-            df["STOCHRSI_D"] = stoch_rsi.iloc[:, 1]
-
-        macd = ta.macd(close, fast=12, slow=26, signal=9)
-        if macd is not None and not macd.empty:
-            df["MACD"] = macd.iloc[:, 0]
-            df["MACD_SIGNAL"] = macd.iloc[:, 1]
-            df["MACD_HIST"] = macd.iloc[:, 2]
-
-        # --- 波动率 & 布林 ---
-        df["ATR_14"] = ta.atr(high, low, close, length=14)
-        bb = ta.bbands(close, length=20, std=2)
-        if bb is not None and not bb.empty:
-            df["BB_LOWER"] = bb.iloc[:, 0]
-            df["BB_MID"] = bb.iloc[:, 1]
-            df["BB_UPPER"] = bb.iloc[:, 2]
-            df["BB_WIDTH"] = (bb.iloc[:, 2] - bb.iloc[:, 0]) / bb.iloc[:, 1]
-
-        # --- 趋势强度 ADX/DI ---
-        adx = ta.adx(high, low, close, length=14)
-        if adx is not None and not adx.empty:
-            df["ADX_14"] = adx.iloc[:, 0]
-            df["+DI_14"] = adx.iloc[:, 1]
-            df["-DI_14"] = adx.iloc[:, 2]
-
-        # --- Supertrend（pandas_ta 内置） ---
-        try:
-            st_df = ta.supertrend(high, low, close, length=10, multiplier=3.0)
-            if st_df is not None and not st_df.empty:
-                df["SUPERT"] = st_df.iloc[:, 0]
-                df["SUPERT_DIR"] = st_df.iloc[:, 1]
-        except Exception:
-            pass
-
-        # --- 资金流 ---
-        df["MFI_14"] = ta.mfi(high, low, close, vol, length=14)
-        df["OBV"] = ta.obv(close, vol)
-        df["OBV_MA"] = ta.ema(df["OBV"], length=20)
-        df["VOL_MA_20"] = ta.sma(vol, length=20)
-
-        return df.dropna().copy()
-
-
-# ============================================================
-# 3. 单周期分析 + 简单回测
-# ============================================================
-
-class SingleFrameAnalyst:
+@st.cache_data(show_spinner=False)
+def fetch_okx_candles(inst_id: str, bar: str = "4H", limit: int = 500) -> pd.DataFrame:
     """
-    单一周期的“量化交易员”：
-    - 读取一整个 DataFrame
-    - 用一堆指标给当前 K 线多空打分
-    - 给出方向 + 止盈止损建议
-    - 做一个非常简化的 histórico 信号回测（胜率 + 平均R）
+    从 OKX 获取 K 线数据
+    inst_id: 如 'BTC-USDT-SWAP' 或 'BTC-USDT'
+    bar: '1H','4H','1D' 等
+    limit: 条数，OKX 单次最大通常在 300 左右，具体以文档为准
     """
-
-    def __init__(self, df: pd.DataFrame, tf: str):
-        self.df = df
-        self.tf = tf
-        self.label = TF_LABELS.get(tf, tf)
-
-    def analyze(self) -> SignalExplanation:
-        d = self.df.iloc[-1]
-        prev = self.df.iloc[-2]
-
-        price = d["close"]
-        ema10, ema20, ema50, ema100, ema200 = (
-            d["EMA_10"], d["EMA_20"], d["EMA_50"], d["EMA_100"], d["EMA_200"]
-        )
-        sma20 = d.get("SMA_20", np.nan)
-        sma50 = d.get("SMA_50", np.nan)
-
-        rsi = d.get("RSI_14", np.nan)
-        st_k = d.get("STOCHRSI_K", np.nan)
-        st_d = d.get("STOCHRSI_D", np.nan)
-        macd = d.get("MACD", np.nan)
-        macd_sig = d.get("MACD_SIGNAL", np.nan)
-        macd_hist = d.get("MACD_HIST", np.nan)
-        atr = d.get("ATR_14", np.nan)
-        bb_width = d.get("BB_WIDTH", np.nan)
-        adx = d.get("ADX_14", np.nan)
-        plus_di = d.get("+DI_14", np.nan)
-        minus_di = d.get("-DI_14", np.nan)
-        supert_dir = d.get("SUPERT_DIR", np.nan)
-        mfi = d.get("MFI_14", np.nan)
-        vol = d["volume"]
-        vol_ma = d.get("VOL_MA_20", np.nan)
-        obv = d.get("OBV", np.nan)
-        obv_ma = d.get("OBV_MA", np.nan)
-
-        long_score = 0.0
-        short_score = 0.0
-        reasons: List[str] = []
-        regime = "中性结构"
-
-        # ========== 1. 趋势结构：价格 vs EMA / SMA 梯队 ==========
-        if price > ema20 > ema50 > ema100:
-            reasons.append("趋势结构：价格强势踏在 EMA20/50/100 之上，多头主导，中短期抬升节奏良好。")
-            long_score += 3.0
-        elif price < ema20 < ema50 < ema100:
-            reasons.append("趋势结构：价格长期压在 EMA20/50/100 之下，空头主导，反弹大多是逃命波。")
-            short_score += 3.0
-        else:
-            reasons.append("趋势结构：均线相互纠缠，趋势不纯，更像是多空拉锯的中性区间。")
-
-        # 大级别慢均线位置：价格相对 EMA200 / SMA50 的大势判断
-        if price > ema200:
-            reasons.append("长期均线：价格整体运行在 EMA200 之上，长期结构偏多。")
-            long_score += 1.0
-        elif price < ema200:
-            reasons.append("长期均线：价格整体运行在 EMA200 之下，长期结构偏空。")
-            short_score += 1.0
-
-        if price > sma50 > sma20:
-            reasons.append("中期均线：SMA20 在 SMA50 下方，短线节奏略显急促，多头仍占优但存在回踩需求。")
-        elif price < sma50 < sma20:
-            reasons.append("中期均线：SMA20 在 SMA50 上方但价格已跌破，说明短期多头有被反杀的风险。")
-
-        # ========== 2. ADX / DI：趋势强度 + 谁在主导 ==========
-        if not math.isnan(adx):
-            if adx >= 25:
-                regime = "趋势主导"
-                if plus_di > minus_di:
-                    long_score += 1.5
-                    reasons.append(f"ADX ≈ {adx:.1f}，趋势强度已成型，且 +DI > -DI，多头趋势占上风。")
-                else:
-                    short_score += 1.5
-                    reasons.append(f"ADX ≈ {adx:.1f}，趋势强度已成型，且 -DI > +DI，空头趋势占上风。")
-            elif adx <= 15:
-                regime = "震荡为主"
-                reasons.append(f"ADX ≈ {adx:.1f}，动能偏弱，目前更像是区间博弈而非趋势单边。")
-            else:
-                reasons.append(f"ADX ≈ {adx:.1f}，趋势刚起步或处于过渡阶段，还没完全站队。")
-
-        # ========== 3. Supertrend 作为“趋势护盾” ==========
-        if not math.isnan(supert_dir):
-            if supert_dir > 0:
-                long_score += 1.0
-                reasons.append("Supertrend 当前在价格下方，相当于给多头提供了一个动态抬升的防守位。")
-            elif supert_dir < 0:
-                short_score += 1.0
-                reasons.append("Supertrend 当前压在价格上方，对多头形成天花板，反弹容易被压制。")
-
-        # ========== 4. RSI / StochRSI：情绪极端 & 拐点线索 ==========
-        if not math.isnan(rsi):
-            if rsi > 70:
-                reasons.append(f"RSI ≈ {rsi:.1f}，情绪已经偏热，继续追高需要非常坚实的资金接力。")
-                short_score += 1.0
-            elif rsi < 30:
-                reasons.append(f"RSI ≈ {rsi:.1f}，情绪极度悲观，往往离情绪修复不远。")
-                long_score += 1.0
-
-        if not math.isnan(st_k) and not math.isnan(st_d):
-            if st_k < 0.2 and st_d < 0.2 and st_k > st_d:
-                reasons.append("StochRSI：在深度超卖区出现金叉，短线多头有“反扑权”。")
-                long_score += 1.0
-            elif st_k > 0.8 and st_d > 0.8 and st_k < st_d:
-                reasons.append("StochRSI：在高位死叉，资金在高位开始兑现，短线向上空间有限。")
-                short_score += 1.0
-
-        # ========== 5. MACD：中期动能的增减 ==========
-        if not math.isnan(macd) and not math.isnan(macd_sig) and not math.isnan(macd_hist):
-            prev_hist = prev.get("MACD_HIST", 0.0)
-            if macd > macd_sig and macd_hist > prev_hist:
-                reasons.append("MACD：多头柱放大且线在信号线上方，中期上涨动能在积累。")
-                long_score += 1.5
-            elif macd < macd_sig and macd_hist < prev_hist:
-                reasons.append("MACD：空头柱放大且线在信号线下方，中期下跌动能在积累。")
-                short_score += 1.5
-
-        # ========== 6. 波动率 & 布林带状态 ==========
-        if not math.isnan(bb_width):
-            if bb_width < 0.03:
-                reasons.append(f"布林带带宽仅 {bb_width*100:.1f}%：波动极度收缩，大行情往往从这种“闷局”后突然爆发。")
-            elif bb_width > 0.08:
-                reasons.append(f"布林带带宽约 {bb_width*100:.1f}%：波动已经被彻底点燃，追单容易被剧烈回撤洗出去。")
-
-        # ========== 7. 资金流：MFI / OBV / 成交量 ==========
-        if not math.isnan(mfi):
-            if mfi > 80:
-                reasons.append(f"MFI ≈ {mfi:.1f}，买盘极度拥挤，任何利空都可能触发多头集体减仓。")
-                short_score += 0.5
-            elif mfi < 20:
-                reasons.append(f"MFI ≈ {mfi:.1f}，资金极度悲观，稍有利好就可能点燃一轮报复性反弹。")
-                long_score += 0.5
-
-        if not math.isnan(obv) and not math.isnan(obv_ma):
-            if obv > obv_ma:
-                reasons.append("OBV 在其均线上方，量价同向上行，说明有“真金白银”在推这波行情。")
-                long_score += 0.5
-            elif obv < obv_ma:
-                reasons.append("OBV 在其均线下方，价格的每一次拉升都更像是“无量空拉”。")
-                short_score += 0.5
-
-        if not math.isnan(vol_ma):
-            if vol > 1.5 * vol_ma:
-                reasons.append("当前成交量明显高于近 20 根均量，这个价位附近多空正在认真表态。")
-            elif vol < 0.6 * vol_ma:
-                reasons.append("成交量显著低于均值，这一波波动更像是“假动作”和“试探”。")
-
-        # ========== 8. 多空方向综合 ==========
-        net_score = long_score - short_score
-        conviction = min(100.0, abs(net_score) * 9.0)  # 放大一点差值
-
-        if net_score >= 2.5:
-            bias = "偏多 / 顺势做多优先"
-        elif net_score <= -2.5:
-            bias = "偏空 / 反弹做空优先"
-        elif -1.5 < net_score < 1.5:
-            bias = "震荡 / 观望为主"
-        else:
-            bias = "轻微倾向，但不足以重仓下注"
-
-        # ========== 9. 根据 ATR + 近期结构给出止盈止损 ==========
-        entry_hint = price
-        stop_loss = None
-        tp1 = None
-        tp2 = None
-        rr1 = None
-        rr2 = None
-
-        lookback = 40
-        recent = self.df.iloc[-lookback:]
-        recent_low = recent["low"].min()
-        recent_high = recent["high"].max()
-
-        if not math.isnan(atr) and atr > 0:
-            if net_score >= 2.5:
-                # 做多：止损压在结构低点 / 1.5 ATR 之下
-                sl_1 = price - 1.5 * atr
-                sl_2 = recent_low
-                stop_loss = min(sl_1, sl_2)
-                risk = max(price - stop_loss, 1e-8)
-                tp1 = price + 2.0 * risk
-                tp2 = price + 3.5 * risk
-                rr1 = 2.0
-                rr2 = 3.5
-                reasons.append("止损放在 1.5 ATR 与近期结构低点更深处，只在真正确认错了才认输。")
-            elif net_score <= -2.5:
-                # 做空：止损顶在结构高点 / 1.5 ATR 之上
-                sl_1 = price + 1.5 * atr
-                sl_2 = recent_high
-                stop_loss = max(sl_1, sl_2)
-                risk = max(stop_loss - price, 1e-8)
-                tp1 = price - 2.0 * risk
-                tp2 = price - 3.5 * risk
-                rr1 = 2.0
-                rr2 = 3.5
-                reasons.append("止损顶在 1.5 ATR 与近期结构高点更高处，只在行情真空头反转时离场。")
-            else:
-                reasons.append("当前周期多空打分不够极端，本周期仅做参考，不给机械挂单的止损止盈。")
-        else:
-            reasons.append("ATR 数据异常，本周期仅给出方向性结论，不做具体点位管理。")
-
-        # ========== 10. 简单历史回测：这套打分是否“有点用”？ ==========
-        bt_trades, bt_winrate, bt_avg_rr = self._simple_backtest()
-
-        return SignalExplanation(
-            timeframe=self.label,
-            regime=regime,
-            bias=bias,
-            conviction=conviction,
-            long_score=long_score,
-            short_score=short_score,
-            reasons=reasons,
-            entry_hint=entry_hint,
-            stop_loss=stop_loss,
-            take_profit_1=tp1,
-            take_profit_2=tp2,
-            reward_risk_1=rr1,
-            reward_risk_2=rr2,
-            bt_trades=bt_trades,
-            bt_winrate=bt_winrate,
-            bt_avg_rr=bt_avg_rr,
-        )
-
-    # ---------- 简化版回测 ----------
-    def _simple_backtest(self, lookback: int = 220) -> Tuple[int, Optional[float], Optional[float]]:
-        """
-        思路：
-        - 回到历史数据里，每一根 K 线都重新算一次 long_score / short_score
-        - 当 net_score >= 2.5 或 <= -2.5 时，视为一个信号
-        - 用接下来的 3 根 K 线，模拟简单 RR 结果
-        - 统计最近 N 笔信号的胜率与平均 R
-        """
-        df = self.df.tail(lookback).copy()
-        if len(df) < 120:
-            return 0, None, None
-
-        results: List[float] = []
-
-        for i in range(40, len(df) - 3):
-            row = df.iloc[i]
-            prev = df.iloc[i - 1]
-
-            price = row["close"]
-            ema20 = row["EMA_20"]
-            ema50 = row["EMA_50"]
-            ema100 = row["EMA_100"]
-            ema200 = row["EMA_200"]
-            rsi = row.get("RSI_14", np.nan)
-            adx = row.get("ADX_14", np.nan)
-            plus_di = row.get("+DI_14", np.nan)
-            minus_di = row.get("-DI_14", np.nan)
-            macd = row.get("MACD", np.nan)
-            macd_sig = row.get("MACD_SIGNAL", np.nan)
-            macd_hist = row.get("MACD_HIST", np.nan)
-            atr = row.get("ATR_14", np.nan)
-            supert_dir = row.get("SUPERT_DIR", np.nan)
-
-            if math.isnan(atr) or atr <= 0:
-                continue
-
-            long_s = 0.0
-            short_s = 0.0
-
-            # 同一套打分逻辑（简化版）
-            if price > ema20 > ema50 > ema100:
-                long_s += 2.0
-            elif price < ema20 < ema50 < ema100:
-                short_s += 2.0
-
-            if not math.isnan(adx) and adx >= 25:
-                if plus_di > minus_di:
-                    long_s += 1.0
-                else:
-                    short_s += 1.0
-
-            if not math.isnan(rsi):
-                if rsi < 30:
-                    long_s += 1.0
-                elif rsi > 70:
-                    short_s += 1.0
-
-            if not (math.isnan(macd) or math.isnan(macd_sig) or math.isnan(macd_hist)):
-                prev_hist = prev.get("MACD_HIST", 0.0)
-                if macd > macd_sig and macd_hist > prev_hist:
-                    long_s += 1.0
-                elif macd < macd_sig and macd_hist < prev_hist:
-                    short_s += 1.0
-
-            if not math.isnan(supert_dir):
-                if supert_dir > 0:
-                    long_s += 0.5
-                elif supert_dir < 0:
-                    short_s += 0.5
-
-            net = long_s - short_s
-
-            # 多头信号
-            if net >= 2.5:
-                entry = price
-                sl = entry - 1.5 * atr
-                risk = entry - sl
-                tp = entry + 2.0 * risk
-                outcome_rr = self._simulate_trade(df.iloc[i+1:i+4], "long", entry, sl, tp)
-                results.append(outcome_rr)
-            # 空头信号
-            elif net <= -2.5:
-                entry = price
-                sl = entry + 1.5 * atr
-                risk = sl - entry
-                tp = entry - 2.0 * risk
-                outcome_rr = self._simulate_trade(df.iloc[i+1:i+4], "short", entry, sl, tp)
-                results.append(outcome_rr)
-
-        if not results:
-            return 0, None, None
-
-        wins = sum(1 for r in results if r > 0)
-        winrate = wins / len(results)
-        avg_rr = sum(results) / len(results)
-        return len(results), winrate, avg_rr
-
-    @staticmethod
-    def _simulate_trade(subdf: pd.DataFrame, direction: str, entry: float, sl: float, tp: float) -> float:
-        """
-        非严格回测，只是用“最多走 3 根 K 线”的窗口，看：
-        - 先触发止盈？则记 +2R
-        - 先触发止损？则记 -1R
-        - 都没触发？按最后收盘价换算成 R
-        """
-        if len(subdf) == 0:
-            return 0.0
-
-        if direction == "long":
-            risk = entry - sl
-            for _, r in subdf.iterrows():
-                if r["low"] <= sl:
-                    return -1.0
-                if r["high"] >= tp:
-                    return 2.0
-            final = subdf.iloc[-1]["close"]
-            return (final - entry) / risk
-        else:
-            risk = sl - entry
-            for _, r in subdf.iterrows():
-                if r["high"] >= sl:
-                    return -1.0
-                if r["low"] <= tp:
-                    return 2.0
-            final = subdf.iloc[-1]["close"]
-            return (entry - final) / risk
-
-
-# ============================================================
-# 5. 多周期综合：像把一桌交易员关在会议室吵完
-# ============================================================
-
-class MultiFrameChiefAnalyst:
-    def __init__(self, signals: Dict[str, Optional[SignalExplanation]]):
-        self.signals = signals
-
-    def synthesize(self) -> Tuple[str, str, float]:
-        """
-        把各个周期的多空打分加权合并，给出：
-        - 一句话总结
-        - 立场（BULL / BEAR / STRONG_BULL / STRONG_BEAR / NEUTRAL）
-        - 综合置信度
-        """
-        weights = {"1m": 0.5, "5m": 0.7, "15m": 1.0, "1h": 1.8, "4h": 2.3, "1d": 2.8}
-        bull_power = 0.0
-        bear_power = 0.0
-        fragments = []
-
-        for tf, sig in self.signals.items():
-            if sig is None:
-                continue
-            w = weights.get(tf, 1.0)
-            net = sig.long_score - sig.short_score
-            if net > 0:
-                bull_power += net * w
-            elif net < 0:
-                bear_power += -net * w
-
-            if net > 1.5:
-                direction = "偏多"
-            elif net < -1.5:
-                direction = "偏空"
-            else:
-                direction = "震荡"
-            fragments.append(f"{sig.timeframe}：{direction}")
-
-        if bull_power == 0 and bear_power == 0:
-            return "所有周期都在犹豫，市场暂时没有给出可交易级别的清晰信号。", "NEUTRAL", 5.0
-
-        total = bull_power + bear_power
-        bull_ratio = bull_power / total
-        conviction = min(100.0, total * 6.5)
-
-        if bull_ratio > 0.72 and bull_power > 7:
-            stance = "STRONG_BULL"
-            main = "多头从超短线到趋势几乎全面占优，这是可以主动拥抱的多头环境。"
-        elif bull_ratio > 0.55 and bull_power > bear_power:
-            stance = "BULL"
-            main = "整体略偏多，更适合在回调中接多，而不是在局部极端价位去追高。"
-        elif bull_ratio < 0.28 and bear_power > 7:
-            stance = "STRONG_BEAR"
-            main = "多周期共振偏空，反弹更像是空头加仓或多头减仓的机会。"
-        elif bull_ratio < 0.45 and bear_power > bull_power:
-            stance = "BEAR"
-            main = "整体略偏空，做空比做多更有胜率，但需要尊重反弹的杀伤力。"
-        else:
-            stance = "NEUTRAL"
-            main = "各周期信号分裂，没有统一方向，这种时候仓位和杠杆都应该收缩。"
-
-        detail = " | ".join(fragments)
-        return main + " 细分维度：" + detail, stance, conviction
-
-
-# ============================================================
-# 6. 仓位管理：根据风险预算倒推币数
-# ============================================================
-
-def compute_position(
-    equity_usdt: float,
-    risk_pct: float,
-    entry: float,
-    stop: float,
-    contract_mult: float = 1.0,
-) -> Tuple[float, float]:
-    """
-    根据：
-    - 账户总资金 equity_usdt
-    - 单笔愿意亏损的百分比 risk_pct
-    - 入场价 entry
-    - 止损价 stop
-    计算：
-    - 建议持仓数量（币数或合约张数）
-    - 对应的最大亏损金额
-    """
-    if equity_usdt <= 0 or risk_pct <= 0 or entry <= 0 or stop <= 0 or entry == stop:
-        return 0.0, 0.0
-    max_loss = equity_usdt * (risk_pct / 100.0)
-    per_unit_loss = abs(entry - stop) * contract_mult
-    if per_unit_loss <= 0:
-        return 0.0, 0.0
-    size = max_loss / per_unit_loss
-    return size, max_loss
-
-
-# ============================================================
-# 7. UI 渲染（全部用 Markdown，杜绝 HTML 变代码）
-# ============================================================
-
-def render_signal_block(sig: Optional[SignalExplanation]):
-    if sig is None:
-        st.info("该周期数据不足，暂不输出观点。")
-        return
-
-    st.markdown(f"#### {sig.timeframe}")
-
-    # 标题行：方向 + 置信度 + 市场状态
-    st.markdown(
-        f"- **方向**：{sig.bias}  \n"
-        f"- **模型置信度**：`{sig.conviction:.0f} / 100`  \n"
-        f"- **当前结构**：{sig.regime}"
-    )
-
-    st.markdown("**这套模型是怎么想的？（核心理由）**")
-    for r in sig.reasons:
-        st.markdown(f"- {r}")
-
-    # 止盈止损
-    if sig.stop_loss is not None and sig.take_profit_1 is not None:
-        st.markdown("**执行参数建议（仅作研究示例，不构成投资建议）**")
-        dir_word = "做多" if sig.long_score > sig.short_score else "做空"
-        rr1 = f"{sig.reward_risk_1:.1f}R" if sig.reward_risk_1 else "—"
-        rr2 = f"{sig.reward_risk_2:.1f}R" if sig.reward_risk_2 else "—"
-
-        st.markdown(
-            f"- 执行方向：**{dir_word}**  \n"
-            f"- 参考入场：`{sig.entry_hint:,.4f}`  \n"
-            f"- 防守止损：`{sig.stop_loss:,.4f}`  \n"
-            f"- 止盈一档：`{sig.take_profit_1:,.4f}`（约 {rr1}）  \n"
-            f"- 止盈二档：`{sig.take_profit_2:,.4f}`（约 {rr2}）"
-        )
-    else:
-        st.markdown(
-            "> 当前周期打分虽有倾向，但不足以支撑完整挂单计划：仅作方向性参考，"
-            "不建议机械地设置止盈止损。"
-        )
-
-    # 回测表现
-    if sig.bt_trades > 0 and sig.bt_winrate is not None:
-        st.markdown("**历史简单回测（因子打分在本周期的表现）**")
-        st.markdown(
-            f"- 统计样本：最近 **{sig.bt_trades}** 笔模拟信号  \n"
-            f"- 单笔胜率约：**{sig.bt_winrate * 100:.1f}%**  \n"
-            f"- 单笔平均期望：**{sig.bt_avg_rr:.2f}R**  \n"
-            f"> 这并不是对未来的承诺，而是在告诉你：\n"
-            f"> 在过去的数据里，这种多空打分**大致是有一点统计优势的**。"
-        )
-    else:
-        st.markdown("> 历史样本不足，本周期不展示回测统计。")
-
-    st.markdown("---")
-
-
-# ============================================================
-# 8. 主程序：整合一切
-# ============================================================
-
-def main():
-    st.title("🦅 WallStreet Alpha Desk – OKX 多周期量化终端")
-    st.caption("数据源：OKX 公共行情 · 无代理直连 · 仅供量化研究与教育，不构成任何投资建议。")
-
-    # ---------- 侧边栏 ----------
-    with st.sidebar:
-        st.subheader("📡 市场与周期")
-
-        COINS = [
-            "BTC/USDT", "ETH/USDT", "SOL/USDT", "OKB/USDT",
-            "DOGE/USDT", "WIF/USDT", "PEPE/USDT", "SHIB/USDT",
-            "SUI/USDT", "APT/USDT", "ORDI/USDT",
-            "XRP/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT",
-            "NEAR/USDT", "ARB/USDT", "OP/USDT",
-        ]
-        symbol = st.selectbox("选择标的 (OKX 现货)", COINS, index=0)
-
-        all_tfs = ["1m", "5m", "15m", "1h", "4h", "1d"]
-        enabled_tfs = st.multiselect(
-            "启用的周期（建议全选）",
-            options=all_tfs,
-            default=all_tfs,
-        )
-
-        st.subheader("💰 资金 & 风险参数")
-        equity = st.number_input("账户总资金 (USDT)", min_value=100.0, value=10000.0, step=100.0)
-        risk_pct = st.slider("单笔最大风险占比 (%)", 0.1, 5.0, 1.0, 0.1)
-
-        st.markdown(
-            "> 职业交易员不会问“这次能赚多少”，\n"
-            "> 而是先问：“**如果错了，我愿意为这个观点付出多少学费？**”"
-        )
-
-    # ---------- Ticker 信息 ----------
-    engine = OKXDataEngine(OKX_CONFIG)
-    try:
-        ticker = engine.exchange.fetch_ticker(symbol)
-    except Exception as e:
-        st.error(f"无法连接 OKX，请检查网络或 IP 限制。\n{e}")
-        return
-
-    last = ticker.get("last", None)
-    pct = ticker.get("percentage", None) or 0.0
-    if last is None:
-        st.error("Ticker 数据异常。")
-        return
-
-    col_price, col_note = st.columns([2, 3])
-    with col_price:
-        st.markdown(f"### 当前行情：{symbol}")
-        st.markdown(
-            f"- 最新价：**{last:,.4f}** USDT  \n"
-            f"- 24h 变动：**{pct:+.2f}%**  \n"
-            f"- 北京时间：`{(datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')}`"
-        )
-
-    with col_note:
-        st.markdown("### 模型立场说明")
-        st.markdown(
-            "- 这不是一个“预测下一根 K 线”的玩具，而是一套**把主观观点量化**的框架。  \n"
-            "- 它会同时看多周期、多因子，给出：\n"
-            "  - 哪一边更值得你付出风险预算（多 / 空 / 观望）；\n"
-            "  - 如果你愿意下注，止损应该放在哪、止盈应该往哪看；\n"
-            "  - 回头复盘时，这种打法在过去究竟是赚是亏。"
-        )
-
-    # ---------- 多周期数据 & 分析 ----------
-    st.markdown("## 🧠 多周期量化评估")
-
-    signals: Dict[str, Optional[SignalExplanation]] = {}
-    data_cache: Dict[str, Optional[pd.DataFrame]] = {}
-
-    if not enabled_tfs:
-        st.warning("请至少选择一个周期。")
-        return
-
-    prog = st.progress(0.0)
-    for i, tf in enumerate(enabled_tfs):
-        with st.spinner(f"拉取 {symbol} · {tf} 数据 & 计算指标中..."):
-            df = engine.fetch_ohlcv(symbol, tf, limit=700)
-            data_cache[tf] = df
-            if df is None or len(df) < 120:
-                signals[tf] = None
-            else:
-                analyst = SingleFrameAnalyst(df, tf)
-                signals[tf] = analyst.analyze()
-        prog.progress((i + 1) / max(len(enabled_tfs), 1))
-    prog.empty()
-
-    col_short, col_long = st.columns(2)
-
-    with col_short:
-        st.markdown("### 🎯 短线/超短线视角")
-        for tf in ["1m", "5m", "15m"]:
-            if tf in enabled_tfs:
-                render_signal_block(signals.get(tf))
-
-    with col_long:
-        st.markdown("### 🌊 中线 / 波段 / 趋势视角")
-        for tf in ["1h", "4h", "1d"]:
-            if tf in enabled_tfs:
-                render_signal_block(signals.get(tf))
-
-    # ---------- 首席分析师统一裁决 ----------
-    st.markdown("## 🏛 首席分析师 · 统一结论")
-
-    chief = MultiFrameChiefAnalyst(signals)
-    summary, stance, global_conviction = chief.synthesize()
-
-    color_map = {
-        "STRONG_BULL": "🟢",
-        "BULL": "🟩",
-        "NEUTRAL": "⚪",
-        "BEAR": "🟥",
-        "STRONG_BEAR": "🔴",
+    url = f"{BASE_URL}/api/v5/market/candles"
+    params = {
+        "instId": inst_id,
+        "bar": bar,
+        "limit": limit
     }
-    emoji = color_map.get(stance, "⚪")
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "0":
+        raise ValueError(f"OKX API error: {data.get('msg')}")
+    raw = data.get("data", [])
 
-    st.markdown(
-        f"**{emoji} 总体立场：{stance} · 模型综合置信度：`{global_conviction:.0f} / 100`**  \n\n"
-        f"{summary}"
+    # 返回是最新在前，需倒序
+    df = pd.DataFrame(
+        raw,
+        columns=[
+            "ts", "open", "high", "low", "close", "vol",
+            "volCcy", "volCcyQuote", "confirm"
+        ]
     )
+    # 类型转换
+    df["ts"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+    for col in ["open", "high", "low", "close", "vol"]:
+        df[col] = df[col].astype(float)
 
-    st.markdown(
-        "> 把所有时间尺度的交易员关在一个会议室里吵三小时，\n"
-        "> 你现在看到的，就是他们“勉强达成一致”后的会议纪要。"
-    )
+    df = df.sort_values("ts").reset_index(drop=True)
+    df = df.set_index("ts")
+    return df
 
-    # ---------- 仓位与执行建议 ----------
-    st.markdown("## 📦 仓位与执行模板（示意）")
 
-    # 选择一个“主操作周期”作为执行参考：优先 1h / 4h / 15m / 1d
-    main_sig = None
-    for key in ["1h", "4h", "15m", "1d", "5m"]:
-        if key in enabled_tfs and signals.get(key) is not None:
-            sig = signals[key]
-            if sig is not None and sig.stop_loss is not None:
-                main_sig = sig
-                break
+# =============================
+# 技术指标函数
+# =============================
 
-    if main_sig is None or main_sig.stop_loss is None:
-        st.info(
-            "当前没有找到【既有方向又设定了止损】的主周期信号。\n\n"
-            "这通常意味着：\n"
-            "- 各周期意见分裂、力度不够；\n"
-            "- 或者波动结构不支持合理的止损点位。\n\n"
-            "在这种市场状态下，**观望本身就是一种非常职业的选择**。"
-        )
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    gain = pd.Series(gain, index=series.index)
+    loss = pd.Series(loss, index=series.index)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    atr_val = tr.ewm(alpha=1 / period, adjust=False).mean()
+    return atr_val
+
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def bollinger_bands(series: pd.Series, period: int = 20, num_std: float = 2.0):
+    ma = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper = ma + num_std * std
+    lower = ma - num_std * std
+    return ma, upper, lower
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    在原始 OHLCV 基础上添加常用技术指标
+    """
+    df = df.copy()
+    close = df["close"]
+
+    df["ema_fast"] = ema(close, 12)
+    df["ema_med"] = ema(close, 50)
+    df["ema_slow"] = ema(close, 200)
+
+    df["rsi"] = rsi(close, 14)
+    df["atr"] = atr(df, 14)
+
+    df["macd"], df["macd_signal"], df["macd_hist"] = macd(close)
+
+    df["bb_mid"], df["bb_upper"], df["bb_lower"] = bollinger_bands(close, 20, 2)
+
+    # 波动率（简单用 ATR/Close 表示）
+    df["volatility"] = df["atr"] / (df["close"] + 1e-9)
+
+    return df
+
+
+# =============================
+# 因子打分：趋势 / 反转 / 波动率
+# =============================
+
+def clamp(x, min_v=-1.0, max_v=1.0):
+    return max(min_v, min(max_v, x))
+
+
+def compute_style_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    输入：已计算指标的 df
+    输出：三个风格因子 + 综合多空评分（-1~1）
+    """
+    df = df.copy()
+    factors = pd.DataFrame(index=df.index)
+
+    # ---- 趋势因子：EMA 排列 + MACD + 价格相对均线
+    trend_score = []
+
+    for idx, row in df.iterrows():
+        score = 0.0
+        w_sum = 0.0
+
+        # EMA 排列：fast > med > slow 强多头
+        if not np.isnan(row["ema_fast"]) and not np.isnan(row["ema_med"]) and not np.isnan(row["ema_slow"]):
+            if row["ema_fast"] > row["ema_med"] > row["ema_slow"]:
+                score += 0.6
+            elif row["ema_fast"] < row["ema_med"] < row["ema_slow"]:
+                score -= 0.6
+            w_sum += 0.6
+
+        # MACD 大于 0 倾向多；小于 0 倾向空
+        if not np.isnan(row["macd"]):
+            macd_norm = np.tanh(row["macd"] / (row["close"] * 0.01 + 1e-9))
+            score += 0.3 * macd_norm
+            w_sum += 0.3
+
+        # 价格相对 200EMA 的偏离（趋势状态）
+        if not np.isnan(row["ema_slow"]):
+            dev = (row["close"] - row["ema_slow"]) / (row["ema_slow"] + 1e-9)
+            dev_norm = np.tanh(dev * 3)
+            score += 0.3 * dev_norm
+            w_sum += 0.3
+
+        if w_sum > 0:
+            score = score / w_sum
+        trend_score.append(clamp(score))
+
+    factors["trend_factor"] = trend_score
+
+    # ---- 反转因子：RSI + 价格相对布林带
+    reversal_score = []
+    for idx, row in df.iterrows():
+        score = 0.0
+        w_sum = 0.0
+
+        # RSI：<30 认为有反弹潜力（看多反转）；>70 有回调潜力（看空反转）
+        if not np.isnan(row["rsi"]):
+            if row["rsi"] < 30:
+                # 超卖越深，反转越强
+                score += (30 - row["rsi"]) / 30.0  # 0~1
+            elif row["rsi"] > 70:
+                score -= (row["rsi"] - 70) / 30.0
+            w_sum += 1.0
+
+        # 布林带：跌破下轨 -> 看多反转；突破上轨 -> 看空反转
+        if not np.isnan(row["bb_lower"]) and not np.isnan(row["bb_upper"]):
+            if row["close"] < row["bb_lower"]:
+                score += 0.7
+                w_sum += 0.7
+            elif row["close"] > row["bb_upper"]:
+                score -= 0.7
+                w_sum += 0.7
+
+        if w_sum > 0:
+            score = score / w_sum
+        reversal_score.append(clamp(score))
+
+    factors["reversal_factor"] = reversal_score
+
+    # ---- 波动率因子：适中最好，过高或过低都扣分
+    # 先算波动率分布的中位数和 IQR
+    vol = df["volatility"].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(vol) > 0:
+        med = vol.median()
+        iqr = vol.quantile(0.75) - vol.quantile(0.25)
+        if iqr == 0:
+            iqr = med if med != 0 else 1.0
     else:
-        entry = main_sig.entry_hint
-        stop = main_sig.stop_loss
-        size, max_loss = compute_position(equity, risk_pct, entry, stop, contract_mult=1.0)
+        med, iqr = 0.0, 1.0
 
-        dir_word = "做多" if main_sig.long_score > main_sig.short_score else "做空"
-        rr1 = f"{main_sig.reward_risk_1:.1f}R" if main_sig.reward_risk_1 else "—"
-        rr2 = f"{main_sig.reward_risk_2:.1f}R" if main_sig.reward_risk_2 else "—"
+    vol_scores = []
+    for v in df["volatility"]:
+        if np.isnan(v):
+            vol_scores.append(0.0)
+            continue
+        z = (v - med) / (iqr + 1e-9)
+        # |z| < 0.5 -> 适中，得分接近 1
+        # |z| > 2   -> 过低/过高，得分接近 -1
+        score = 1.0 - min(abs(z) / 2.0, 2.0)  # 1 -> -1
+        vol_scores.append(clamp(score, -1, 1))
+    factors["volatility_factor"] = vol_scores
 
-        st.markdown(f"### 当前主操作周期：**{main_sig.timeframe}** · 建议执行方向：**{dir_word}**")
-        st.markdown(
-            f"- 参考入场价：`{entry:,.4f}`  \n"
-            f"- 防守止损：`{stop:,.4f}`  \n"
-            f"- 止盈一档：`{main_sig.take_profit_1:,.4f}`（约 {rr1}）  \n"
-            f"- 止盈二档：`{main_sig.take_profit_2:,.4f}`（约 {rr2}）"
-        )
-
-        st.markdown("#### 基于你的资金，模型建议的仓位是？")
-        st.markdown(
-            f"- 账户总资金：**{equity:,.0f} USDT**  \n"
-            f"- 单笔愿意承受的最大回撤：**{risk_pct:.1f}% ≈ {max_loss:,.2f} USDT**  \n"
-            f"- 在当前入场与止损距离下：  \n"
-            f"  - **建议仓位 ≈ `{size:,.4f}` 币（1x 杠杆等效）**  \n"
-        )
-
-        st.markdown(
-            "#### 这套仓位逻辑，背后真正的含义\n"
-            "- 你不是在问“这次能赚多少”，而是在设计一个**统一的亏损上限**：\n"
-            f"  - 不管行情多吓人，这一笔最多亏大约 **{risk_pct:.1f}%**，你睡得着觉。\n"
-            "- 在这个前提下，让止损**放在“行情真的证明你错了”的位置**，\n"
-            "  而不是放在“你情绪上受不了的地方”。\n"
-            "- 只要你用同一套风险预算，去执行一批有统计优势的信号，\n"
-            "  盈亏曲线自然会从“过山车”变成**相对平滑的权益曲线**。"
-        )
-
-    # ---------- 图表：价格 + 关键均线 ----------
-    st.markdown("## 📈 价格行为与关键均线（用于肉眼 sanity check）")
-
-    chart_tf = "1h" if "1h" in data_cache else (enabled_tfs[-1] if enabled_tfs else "1h")
-    df_chart = data_cache.get(chart_tf)
-
-    if df_chart is not None:
-        dff = df_chart.tail(220)
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Candlestick(
-                x=dff.index,
-                open=dff["open"],
-                high=dff["high"],
-                low=dff["low"],
-                close=dff["close"],
-                increasing_line_color="#16a34a",
-                decreasing_line_color="#dc2626",
-                name="Price",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=dff.index,
-                y=dff["EMA_20"],
-                line=dict(color="#60a5fa", width=1.2),
-                name="EMA 20",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=dff.index,
-                y=dff["EMA_50"],
-                line=dict(color="#fbbf24", width=1.0),
-                name="EMA 50",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=dff.index,
-                y=dff["EMA_200"],
-                line=dict(color="#9ca3af", width=1.0, dash="dot"),
-                name="EMA 200",
-            )
-        )
-
-        fig.update_layout(
-            template="plotly_dark",
-            height=480,
-            margin=dict(l=10, r=10, t=30, b=20),
-            paper_bgcolor="rgba(5,7,17,1)",
-            plot_bgcolor="rgba(5,7,17,1)",
-            xaxis_rangeslider_visible=False,
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1,
-            ),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("图表数据不足，无法绘制 K 线。")
-
-    st.markdown(
-        "> 交易这件事，本质上就是：\n"
-        "> 在一套有正期望的规则上，用**可控的风险**，\n"
-        "> 对市场反复地、机械地敲同一种钉子。"
+    # ---- 综合多空评分：趋势为主，反转为次，波动率作风险调节
+    # 趋势 0.5，反转 0.3，波动率 0.2
+    factors["raw_score"] = (
+        0.5 * factors["trend_factor"] +
+        0.3 * factors["reversal_factor"] +
+        0.2 * factors["volatility_factor"]
     )
 
+    # 波动率作为“置信度”调节：vol_factor 为负时，降低绝对信号强度
+    factors["score"] = factors["raw_score"] * (0.5 + 0.5 * factors["volatility_factor"])
 
-if __name__ == "__main__":
-    main()
+    return factors
+
+
+# =============================
+# 信号 & 止盈止损逻辑
+# =============================
+
+def generate_trade_plan(latest_row: pd.Series,
+                        factor_row: pd.Series,
+                        direction_hint: str,
+                        horizon: str,
+                        risk_reward: float = 2.0):
+    """
+    针对一个周期，基于最新价格 + ATR，给出方向 & 止盈止损。
+    direction_hint: 'long' / 'short' / 'flat'
+    horizon: '超短线','短线','中线','波段','趋势'
+    """
+    price = latest_row["close"]
+    atr_val = latest_row["atr"]
+    if np.isnan(atr_val) or atr_val <= 0:
+        return {"direction": "观望", "entry": np.nan, "sl": np.nan, "tp": np.nan}
+
+    # 不同周期给不同的 ATR 止损宽度
+    if horizon == "超短线":
+        sl_mult = 0.8
+    elif horizon == "短线":
+        sl_mult = 1.2
+    elif horizon == "中线":
+        sl_mult = 1.8
+    elif horizon == "波段":
+        sl_mult = 2.2
+    else:  # 趋势
+        sl_mult = 2.8
+
+    # 若因子评分绝对值太小，则观望
+    score = factor_row["score"] if "score" in factor_row else 0.0
+    if abs(score) < 0.25:
+        return {"direction": "观望", "entry": price, "sl": np.nan, "tp": np.nan}
+
+    # 合并 direction_hint 与 score
+    # 若二者方向冲突，适当减弱
+    dir_from_score = "long" if score > 0 else "short"
+    effective_dir = dir_from_score
+    if direction_hint != "flat" and direction_hint != dir_from_score:
+        # 冲突则观望
+        return {"direction": "观望", "entry": price, "sl": np.nan, "tp": np.nan}
+
+    if effective_dir == "long":
+        sl = price - sl_mult * atr_val
+        tp = price + sl_mult * atr_val * risk_reward
+        direction_zh = "做多"
+    else:
+        sl = price + sl_mult * atr_val
+        tp = price - sl_mult * atr_val * risk_reward
+        direction_zh = "做空"
+
+    return {
+        "direction": direction_zh,
+        "entry": price,
+        "sl": sl,
+        "tp": tp,
+        "score": score,
+        "atr": atr_val
+    }
+
+
+# =============================
+# 简单回测逻辑（基于单一周期）
+# =============================
+
+def backtest_factor_strategy(df: pd.DataFrame,
+                             factors: pd.DataFrame,
+                             score_open_threshold: float = 0.4,
+                             atr_sl_mult: float = 1.2,
+                             rr: float = 2.0,
+                             max_hold_bars: int = 60):
+    """
+    非高频、非精准撮合，仅用于评估策略大致胜率 / 期望。
+    模型：
+      - 当 score > threshold 开多
+      - 当 score < -threshold 开空
+      - 止损：ATR * atr_sl_mult
+      - 止盈：收益:R 风险:1
+      - 同时触发止盈止损时，保守地认为先止损
+      - 不考虑手续费和滑点（可自行扩展）
+    返回：
+      trades_df, equity_curve (Series starting from 1.0)
+    """
+    df_bt = df.copy()
+    df_bt["score"] = factors["score"]
+
+    trades = []
+    equity = [1.0]
+    equity_times = [df_bt.index[0]]
+
+    in_pos = False
+    direction = None
+    entry_price = None
+    sl = None
+    tp = None
+    entry_time = None
+
+    for i in range(len(df_bt)):
+        row = df_bt.iloc[i]
+        time = df_bt.index[i]
+        price = row["close"]
+        score = row["score"]
+        atr_val = row["atr"]
+
+        if not in_pos:
+            if np.isnan(score) or np.isnan(atr_val):
+                continue
+            # 开仓逻辑
+            if score > score_open_threshold:
+                direction = "long"
+            elif score < -score_open_threshold:
+                direction = "short"
+            else:
+                direction = None
+
+            if direction is not None:
+                in_pos = True
+                entry_price = price
+                entry_time = time
+                sl_dist = atr_sl_mult * atr_val
+                if direction == "long":
+                    sl = entry_price - sl_dist
+                    tp = entry_price + sl_dist * rr
+                else:
+                    sl = entry_price + sl_dist
+                    tp = entry_price - sl_dist * rr
+                bars_held = 0
+        else:
+            # 在持仓中，检查止盈止损 or 超时
+            bars_held += 1
+            high = row["high"]
+            low = row["low"]
+            exit_reason = None
+
+            if direction == "long":
+                hit_sl = low <= sl
+                hit_tp = high >= tp
+            else:
+                hit_sl = high >= sl
+                hit_tp = low <= tp
+
+            # 保守处理：同一根 K 线同时触发，先算止损
+            if hit_sl:
+                exit_price = sl
+                exit_time = time
+                exit_reason = "SL"
+            elif hit_tp:
+                exit_price = tp
+                exit_time = time
+                exit_reason = "TP"
+            elif bars_held >= max_hold_bars:
+                exit_price = price
+                exit_time = time
+                exit_reason = "TIME"
+
+            if exit_reason is not None:
+                # 用 R 来衡量盈亏：1R = 止损距离
+                risk_per_unit = abs(entry_price - sl)
+                if risk_per_unit == 0:
+                    r = 0.0
+                else:
+                    if direction == "long":
+                        pnl = exit_price - entry_price
+                    else:
+                        pnl = entry_price - exit_price
+                    r = pnl / risk_per_unit
+
+                trades.append({
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "r": r,
+                    "exit_reason": exit_reason,
+                    "holding_bars": bars_held
+                })
+
+                # 假设每笔风险=1%资金，则资金变化：equity *= (1 + r * 0.01)
+                # 为简化，这里用每笔风险固定为资金的 1 单位，R 直接累计
+                equity.append(equity[-1] * (1 + r * 0.01))
+                equity_times.append(exit_time)
+
+                in_pos = False
+                direction = None
+                entry_price = None
+                sl = None
+                tp = None
+
+    if len(equity) == 1:
+        # 没有任何交易
+        equity_curve = pd.Series([1.0, 1.0], index=[df_bt.index[0], df_bt.index[-1]])
+        trades_df = pd.DataFrame(columns=[
+            "entry_time", "exit_time", "direction", "entry_price",
+            "exit_price", "r", "exit_reason", "holding_bars"
+        ])
+    else:
+        equity_curve = pd.Series(equity, index=equity_times)
+        trades_df = pd.DataFrame(trades)
+
+    return trades_df, equity_curve
+
+
+def summarize_trades(trades_df: pd.DataFrame):
+    if trades_df.empty:
+        return {}
+
+    total = len(trades_df)
+    wins = (trades_df["r"] > 0).sum()
+    losses = (trades_df["r"] < 0).sum()
+    win_rate = wins / total if total > 0 else 0.0
+    avg_r = trades_df["r"].mean()
+    avg_win = trades_df.loc[trades_df["r"] > 0, "r"].mean() if wins > 0 else 0.0
+    avg_loss = trades_df.loc[trades_df["r"] < 0, "r"].mean() if losses > 0 else 0.0
+
+    # 简单最大回撤（基于 equity=1+累计R 的近似）
+    eq = 1 + trades_df["r"].cumsum()
+    peak = eq.cummax()
+    dd = (eq - peak) / peak
+    max_dd = dd.min()
+
+    return {
+        "total_trades": int(total),
+        "win_rate": float(win_rate),
+        "avg_r": float(avg_r),
+        "avg_win_r": float(avg_win),
+        "avg_loss_r": float(avg_loss),
+        "max_drawdown": float(max_dd)
+    }
+
+
+# =============================
+# 仓位建议（基于资金 & 止损距离）
+# =============================
+
+def position_sizing(capital_usdt: float,
+                    risk_pct: float,
+                    entry_price: float,
+                    stop_price: float):
+    """
+    根据资金 & 风险比例 & 止损价格，给出现货/单向合约的建议币数
+    """
+    if capital_usdt <= 0 or entry_price <= 0 or np.isnan(stop_price):
+        return 0.0, 0.0
+
+    risk_amt = capital_usdt * risk_pct
+    stop_dist = abs(entry_price - stop_price)
+    if stop_dist <= 0:
+        return 0.0, 0.0
+
+    qty = risk_amt / stop_dist
+    # 对于永续合约，一张合约代表的面值需参考 OKX 具体设置，此处给出币数量级
+    notional = qty * entry_price
+    return qty, notional
+
+
+# =============================
+# UI 布局
+# =============================
+
+# ---- Sidebar 参数 ----
+st.sidebar.header("参数设置")
+
+default_inst = "BTC-USDT-SWAP"
+inst_id = st.sidebar.text_input("交易对（OKX instId）", value=default_inst)
+
+timeframes = ["1H", "4H", "1D"]
+main_tf = st.sidebar.selectbox("主回测周期", options=timeframes, index=1)
+
+capital = st.sidebar.number_input("账户资金（USDT）", min_value=100.0, value=10000.0, step=100.0)
+risk_pct = st.sidebar.slider("每笔风险占资金比例", min_value=0.1, max_value=5.0, value=1.0, step=0.1) / 100.0
+
+score_open_th = st.sidebar.slider("开仓信号阈值 |score| >", min_value=0.2, max_value=0.8, value=0.4, step=0.05)
+recent_n = st.sidebar.slider("最近 N 笔信号用于直方图", min_value=10, max_value=200, value=50, step=10)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("数据来自 OKX 公共 API，实际结果可能受接口限制及网络环境影响。")
+
+# ---- 主页面：数据抓取 ----
+with st.spinner("从 OKX 获取数据中..."):
+    try:
+        df_1h = fetch_okx_candles(inst_id, "1H", limit=600)
+        df_4h = fetch_okx_candles(inst_id, "4H", limit=600)
+        df_1d = fetch_okx_candles(inst_id, "1D", limit=600)
+    except Exception as e:
+        st.error(f"获取 OKX 数据失败：{e}")
+        st.stop()
+
+# 添加指标 & 因子
+df_1h_ind = add_indicators(df_1h)
+fac_1h = compute_style_factors(df_1h_ind)
+
+df_4h_ind = add_indicators(df_4h)
+fac_4h = compute_style_factors(df_4h_ind)
+
+df_1d_ind = add_indicators(df_1d)
+fac_1d = compute_style_factors(df_1d_ind)
+
+latest_1h = df_1h_ind.iloc[-1]
+latest_4h = df_4h_ind.iloc[-1]
+latest_1d = df_1d_ind.iloc[-1]
+
+fac_last_1h = fac_1h.iloc[-1]
+fac_last_4h = fac_4h.iloc[-1]
+fac_last_1d = fac_1d.iloc[-1]
+
+current_price = latest_1h["close"]
+st.subheader(f"{inst_id} 当前价格：{current_price:.2f} USDT（基于 1H 最新收盘）")
+
+# =============================
+# 顶层方向判定：多周期逻辑
+# =============================
+
+def dir_from_score(score):
+    if score > 0.15:
+        return "long"
+    elif score < -0.15:
+        return "short"
+    else:
+        return "flat"
+
+
+dir_1h = dir_from_score(fac_last_1h["score"])
+dir_4h = dir_from_score(fac_last_4h["score"])
+dir_1d = dir_from_score(fac_last_1d["score"])
+
+# 组合方向（简单多数表决，日线权重最高）
+vote = {"long": 0, "short": 0, "flat": 0}
+vote[dir_1h] += 1
+vote[dir_4h] += 2
+vote[dir_1d] += 3
+overall_dir = max(vote, key=vote.get)
+
+overall_dir_zh = {
+    "long": "整体偏多",
+    "short": "整体偏空",
+    "flat": "整体观望"
+}[overall_dir]
+
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    st.metric("1H 多空评分", f"{fac_last_1h['score']:.2f}")
+    st.write(f"方向：{dir_1h}")
+with col_b:
+    st.metric("4H 多空评分", f"{fac_last_4h['score']:.2f}")
+    st.write(f"方向：{dir_4h}")
+with col_c:
+    st.metric("1D 多空评分", f"{fac_last_1d['score']:.2f}")
+    st.write(f"方向：{dir_1d}")
+
+st.info(f"多周期综合判断：**{overall_dir_zh}**（1D 权重最高，其次 4H，再是 1H）")
+
+# =============================
+# 各周期交易计划：方向 + 止盈止损 + 仓位建议
+# =============================
+
+st.subheader("多周期交易计划（超短线 / 短线 / 中线 / 波段 / 趋势）")
+
+plans = []
+
+# 定义 5 个维度映射到不同时间框架
+horizon_map = [
+    ("超短线", df_1h_ind, fac_1h),
+    ("短线", df_4h_ind, fac_4h),
+    ("中线", df_1d_ind, fac_1d),
+    ("波段", df_1d_ind, fac_1d),
+    ("趋势", df_1d_ind, fac_1d),
+]
+
+for horizon, df_use, fac_use in horizon_map:
+    latest_row = df_use.iloc[-1]
+    fac_row = fac_use.iloc[-1]
+    # 方向提示：趋势型维度更多参考 1D / 4H 综合方向
+    dir_hint = overall_dir
+    plan = generate_trade_plan(latest_row, fac_row, dir_hint, horizon, risk_reward=2.0)
+
+    # 计算建议仓位
+    qty, notion = position_sizing(
+        capital_usdt=capital,
+        risk_pct=risk_pct,
+        entry_price=plan.get("entry", np.nan),
+        stop_price=plan.get("sl", np.nan)
+    )
+
+    plan["horizon"] = horizon
+    plan["suggest_qty"] = qty
+    plan["suggest_notional"] = notion
+    plans.append(plan)
+
+plans_df = pd.DataFrame(plans)[
+    ["horizon", "direction", "score", "entry", "sl", "tp", "atr", "suggest_qty", "suggest_notional"]
+]
+
+# 格式化展示
+def fmt_row(row):
+    return {
+        "周期": row["horizon"],
+        "方向": row["direction"],
+        "多空评分": f"{row['score']:.2f}" if not pd.isna(row["score"]) else "",
+        "计划进场价": f"{row['entry']:.2f}" if not pd.isna(row["entry"]) else "",
+        "止损价": f"{row['sl']:.2f}" if not pd.isna(row["sl"]) else "",
+        "止盈价": f"{row['tp']:.2f}" if not pd.isna(row["tp"]) else "",
+        "当前 ATR": f"{row['atr']:.2f}" if not pd.isna(row["atr"]) else "",
+        "建议币数": f"{row['suggest_qty']:.4f}" if row["suggest_qty"] > 0 else "",
+        "对应名义价值 USDT": f"{row['suggest_notional']:.2f}" if row["suggest_notional"] > 0 else ""
+    }
+
+plans_fmt = pd.DataFrame([fmt_row(r) for _, r in plans_df.iterrows()])
+st.dataframe(plans_fmt, use_container_width=True)
+
+st.markdown("""
+**解读要点：**
+
+- 若某周期显示“观望”，说明当前因子信号不够强，或与上级周期方向冲突；
+- 建议币数是基于你设置的资金与单笔风险比例计算的，  
+  例如：资金 10,000 USDT、风险 1%、止损距离 100 USDT，则最大亏损 100 USDT，仓位约 1 枚；
+- 趋势周期止损更宽（更大 ATR 倍数），适合低杠杆、低频持有。
+""")
+
+# =============================
+# 风格剖面：趋势 / 反转 / 波动率因子评分
+# =============================
+
+st.subheader("多因子风格剖面（趋势 / 反转 / 波动率）")
+
+style_profile = pd.DataFrame({
+    "因子": ["趋势因子", "反转因子", "波动率因子"],
+    "1H": [
+        fac_last_1h["trend_factor"],
+        fac_last_1h["reversal_factor"],
+        fac_last_1h["volatility_factor"],
+    ],
+    "4H": [
+        fac_last_4h["trend_factor"],
+        fac_last_4h["reversal_factor"],
+        fac_last_4h["volatility_factor"],
+    ],
+    "1D": [
+        fac_last_1d["trend_factor"],
+        fac_last_1d["reversal_factor"],
+        fac_last_1d["volatility_factor"],
+    ],
+})
+
+st.dataframe(style_profile.set_index("因子"), use_container_width=True)
+st.markdown("""
+- 因子区间：-1 ~ 1；  
+  - 趋势因子 > 0 表示偏多头趋势，< 0 表示偏空头；  
+  - 反转因子 > 0 表示更偏向“多头反转”（低位反弹），< 0 偏向“空头反转”；  
+  - 波动率因子接近 1，表示波动处于“健康区间”，策略信号可靠性更高。
+""")
+
+# =============================
+# 回测：最近约 3 个月（取主周期 K 线历史）
+# =============================
+
+st.subheader("简单历史回测：如果机械执行这套模型，过去一段时间表现如何？")
+
+if main_tf == "1H":
+    df_main = df_1h_ind
+    fac_main = fac_1h
+elif main_tf == "4H":
+    df_main = df_4h_ind
+    fac_main = fac_4h
+else:
+    df_main = df_1d_ind
+    fac_main = fac_1d
+
+st.write(f"当前主回测周期：**{main_tf}**，K 线条数：{len(df_main)}（约略对应最近几个月数据，具体取决于 OKX 接口限制）")
+
+trades_df, equity_curve = backtest_factor_strategy(
+    df_main,
+    fac_main,
+    score_open_threshold=score_open_th,
+    atr_sl_mult=1.2,
+    rr=2.0,
+    max_hold_bars=60
+)
+
+summary = summarize_trades(trades_df)
+
+col1, col2, col3, col4, col5 = st.columns(5)
+if summary:
+    col1.metric("总交易次数", summary["total_trades"])
+    col2.metric("胜率", f"{summary['win_rate']*100:.1f}%")
+    col3.metric("单笔平均 R 值", f"{summary['avg_r']:.2f}")
+    col4.metric("平均盈利 R", f"{summary['avg_win_r']:.2f}")
+    col5.metric("最大回撤（基于R近似）", f"{summary['max_drawdown']*100:.1f}%")
+else:
+    st.info("当前参数下暂无足够历史信号用于回测。")
+
+# 资金曲线
+st.markdown("**机械执行净值曲线（假设每笔风险为资金 1 单位，R 换算为约 1% 波动）：**")
+st.line_chart(equity_curve)
+
+# 最近 N 次信号的盈亏直方图
+st.markdown(f"**最近 {min(recent_n, len(trades_df))} 笔信号的盈亏分布（单位：R）**")
+if not trades_df.empty:
+    recent_trades = trades_df.tail(recent_n)
+    hist_data = recent_trades["r"]
+    st.bar_chart(hist_data, height=200)
+    st.write("最近几笔交易明细：")
+    st.dataframe(recent_trades.tail(20), use_container_width=True)
+else:
+    st.info("暂无交易记录，无法绘制盈亏直方图。")
+
+st.markdown("""
+> 回测说明：  
+> - 为简单起见，我们假设：
+>   - 不计交易手续费和滑点；
+>   - 止盈止损在 K 线内按“先触发止损”处理（保守估计）；  
+>   - 每次开仓使用相同的风险规模（R 统一口径）。
+> - 若你要用于实盘，请在此基础上进一步：
+>   - 加入手续费滑点模型；  
+>   - 增加多品种、多周期组合回测；  
+>   - 做真实资金曲线与风控模拟（如最大回撤、卡玛比等）。
+""")
+
+# =============================
+# 风控提示
+# =============================
+
+st.warning("""
+**重要风险提示：**
+
+- 本模型是“技术因子 + 简单规则 + 粗粒度回测”，
+  并非高频做市或复杂机器学习策略；
+- 历史表现不代表未来收益，市场可能在回测期外进入完全不同的结构；
+- 仓位建议只基于“单笔最大亏多少”这一维度，
+  没有考虑你的总品种数量、组合相关性等问题；
+- 真正的专业交易，会把“是否出手”看得比“出手方向”更重要。  
+  当信号不够强，**不交易就是最好的交易**。
+""")
