@@ -698,6 +698,13 @@ st.sidebar.caption("本工具仅作量化分析与回测示范，不涉及真实
 # 数据获取 + 显示北京时间
 # =========================
 
+# =========================
+# 数据获取 + 显示“抓取时间”（北京时间）
+# =========================
+
+# 记录真正的抓取时间（UTC）
+fetch_time_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+
 status_box = st.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据……")
 
 dfs = {}
@@ -715,15 +722,23 @@ if any((df is None or df.empty) for df in dfs.values()):
 
 main_df = dfs[MAIN_TIMEFRAME]
 
-# 用主周期最新一根K线时间，转换为北京时间展示
+# 把抓取时间和最新K线时间都转成北京时间展示
 try:
+    # 抓取时间
+    bj_fetch = fetch_time_utc.tz_convert("Asia/Shanghai")
+    fetch_str = bj_fetch.strftime("%Y年%m月%d日 %H:%M:%S")
+
+    # 最新主周期K线时间（OKX 通常是 UTC 时间戳）
     last_ts = main_df.index[-1]
     if last_ts.tzinfo is None:
-        last_ts = last_ts.tz_localize("UTC")  # OKX 时间戳按UTC处理
-    bj_ts = last_ts.tz_convert("Asia/Shanghai")
-    ts_str = bj_ts.strftime("%Y年%m月%d日 %H:%M:%S")
+        last_ts = last_ts.tz_localize("UTC")
+    bj_kline = last_ts.tz_convert("Asia/Shanghai")
+    kline_str = bj_kline.strftime("%Y年%m月%d日 %H:%M:%S")
+
     status_box.success(
-        f"已从 OKX 获取 {selected_pair} 多周期数据，最新 {MAIN_TIMEFRAME} K 线时间：{ts_str}（北京时间）"
+        f"已从 OKX 获取 {selected_pair} 多周期数据。"
+        f" 抓取时间：{fetch_str}（北京时间），"
+        f"最新 {MAIN_TIMEFRAME} K 线时间：{kline_str}（北京时间）"
     )
 except Exception:
     status_box.success(f"已从 OKX 获取 {selected_pair} 多周期数据。")
@@ -1109,3 +1124,4 @@ st.caption("""
 模型基于历史数据与技术因子，无法保证未来表现。  
 加密货币波动性极高，请谨慎决策，严格止损。
 """)
+
