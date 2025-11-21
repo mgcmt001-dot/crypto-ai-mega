@@ -655,6 +655,7 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         tag_class = "tag-neutral"
 
+    # 头部（注意：打开了两个 div：quant-card & logic-list）
     header = f"""
     <div class="quant-card">
       <div class="quant-header">
@@ -665,7 +666,8 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     """
 
     logic_html = "".join(
-        [f"<div class='logic-item'><div class='logic-bullet'>•</div><div>{r}</div></div>" for r in sig.reasons]
+        f"<div class='logic-item'><div class='logic-bullet'>•</div><div>{r}</div></div>"
+        for r in sig.reasons
     )
 
     # 止盈止损
@@ -702,7 +704,7 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         plan_html = "<div class='plan-box'>本周期仅给出方向性参考，不建议机械挂单。</div>"
 
-    # 回测
+    # 回测块本身是一个独立 div，开关自洽，不影响外层结构
     if sig.bt_trades > 0 and sig.bt_winrate is not None:
         win = sig.bt_winrate * 100
         rr = sig.bt_avg_rr
@@ -716,11 +718,8 @@ def render_signal_card(sig: Optional[SignalExplanation]):
     else:
         bt_html = ""
 
-tail = "</div></div>"   # ❌ 旧的
-
-# 改成：
-
-tail = "</div></div>"   # 如果 header 里你只开启了这两层，就保持一致
+    # 这里要关掉的是 header 里开启的 “logic-list” 和最外层 “quant-card” 两个 div
+    tail = "</div></div>"
 
     st.markdown(header + logic_html + plan_html + bt_html + tail, unsafe_allow_html=True)
 
@@ -1001,5 +1000,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
