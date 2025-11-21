@@ -43,6 +43,11 @@ FEE_RATE = 0.0005           # 手续费假设（单边 0.05%）
 MIN_BARS_FOR_FACTORS = 60   # 起码要有这么多K线才算有因子
 INIT_CAPITAL = 10000.0      # 回测虚拟初始资金（页面不展示）
 
+# 本周期最近 N 根涨跌幅
+PERIOD_RET_LOOKBACK = 20
+# “本月高低点百分位”的窗口（用近 30 天近似）
+MONTH_WINDOW_DAYS = 30
+
 # 时间框架说明（卡片用）
 TF_DESC = {
     "15m": "超短线",
@@ -300,6 +305,8 @@ def build_multi_tf_signals(
     - 因子得分
     - 多空方向
     - 止盈止损点位
+    - 本周期最近 N 根的涨跌幅
+    - 当前价格在近 MONTH_WINDOW_DAYS 天高低点区间的百分位
     """
     rows = []
     for tf, df in dfs.items():
@@ -311,6 +318,7 @@ def build_multi_tf_signals(
         atr = float(last["atr"]) if not np.isnan(last["atr"]) else None
         score = float(last["composite_score"])
 
+        # 方向 & 止盈止损
         direction = None
         sl = None
         tp = None
@@ -323,6 +331,28 @@ def build_multi_tf_signals(
                 direction = "空"
                 sl = price + sl_mult * atr
                 tp = price - tp_mult * atr
+
+        # 近 N 根K线的累计涨跌幅
+        if len(df) > PERIOD_RET_LOOKBACK:
+            period_ret = df["close"].iloc[-1] / df["close"].iloc[-PERIOD_RET_LOOKBACK] - 1
+        else:
+            period_ret = np.nan
+
+        # “本月高低点百分位”：近 MONTH_WINDOW_DAYS 天（不够则用全样本）
+        if len(df) > 5:
+            cutoff = df.index[-1] - timedelta(days=MONTH_WINDOW_DAYS)
+            df_win = df[df.index >= cutoff]
+            if len(df_win) < 5:
+                df_win = df
+            hi = df_win["high"].max()
+            lo = df_win["low"].min()
+            last_close = df_win["close"].iloc[-1]
+            if hi > lo:
+                month_pct = (last_close - lo) / (hi - lo)
+            else:
+                month_pct = np.nan
+        else:
+            month_pct = np.nan
 
         rows.append({
             "timeframe": tf,
@@ -337,7 +367,9 @@ def build_multi_tf_signals(
             "bb_position": last["bb_position"],
             "direction": direction,
             "stop_loss": sl,
-            "take_profit": tp
+            "take_profit": tp,
+            "period_return": period_ret,
+            "month_percentile": month_pct
         })
 
     if not rows:
@@ -346,7 +378,7 @@ def build_multi_tf_signals(
     df_tf = pd.DataFrame(rows).set_index("timeframe")
     df_tf = df_tf.reindex([tf for tf in TIMEFRAMES if tf in df_tf.index])
 
-    # 关键：把 None 转成 NaN，避免格式化时报 TypeError
+    # 把 None 转成 NaN，避免格式化时报 TypeError
     df_tf["stop_loss"] = pd.to_numeric(df_tf["stop_loss"], errors="coerce")
     df_tf["take_profit"] = pd.to_numeric(df_tf["take_profit"], errors="coerce")
 
@@ -354,10 +386,10 @@ def build_multi_tf_signals(
 
 
 def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
-                       long_thr: float, short_thr: float) -> list[str]:
+                       long_thr: float, short_thr: float) -> list:
     """
     为单个周期卡片生成“有逻辑的分析语句”，
-    结合：本周期因子 + 与 4h、1d 的多空关系。
+    结合：本周期因子 + 与 4h、1d 的多空关系 + 近 N 根涨跌 + 本月百分位。
     """
     lines = []
 
@@ -367,6 +399,8 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
     rsi = row["rsi"]
     adx = row["adx"]
     vol_score = row["volatility_score"]
+    period_ret = row.get("period_return", np.nan)
+    month_pct = row.get("month_percentile", np.nan)
 
     dir_4h = tf_signals.loc[MAIN_TIMEFRAME, "direction"] if MAIN_TIMEFRAME in tf_signals.index else None
     dir_1d = tf_signals.loc["1d", "direction"] if "1d" in tf_signals.index else None
@@ -382,14 +416,13 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
 
     # 2）本周期在多周期结构中的角色
     if tf in ["15m", "1h"]:
-        # 短周期 vs 4h / 1d
         if direction in ["多", "空"]:
             if dir_4h == direction and dir_1d == direction:
                 lines.append("短周期与 4 小时、日线同向，属于顺大趋势的短线机会。")
             elif dir_4h == direction and (dir_1d is None or pd.isna(dir_1d)):
                 lines.append("短周期与 4 小时同向，日线中性，适合做波段内部的跟随。")
             elif dir_4h not in [None, direction] and not pd.isna(dir_4h):
-                lines.append("短周期方向与 4 小时相反，更像是趋势中的回调/反弹，持仓周期不宜拉太长。")
+                lines.append("短周期方向与 4 小时相反，更像是趋势中的回调/反弹，持仓周期不宜过长。")
             else:
                 lines.append("短周期信号相对独立，需要结合 4 小时与日线综合判断。")
         else:
@@ -417,7 +450,21 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
             else:
                 lines.append("日线处于趋势与震荡之间的过渡阶段，方向感一般。")
 
-    # 3）技术细节：RSI / ADX / 波动率
+    # 3）近 N 根涨跌幅
+    if pd.notna(period_ret):
+        if period_ret > 0.1:
+            lines.append(f"本周期最近 {PERIOD_RET_LOOKBACK} 根累计上涨约 {period_ret:.1%}，已经走出一段不短的上升行情。")
+        elif period_ret < -0.1:
+            lines.append(f"本周期最近 {PERIOD_RET_LOOKBACK} 根累计下跌约 {period_ret:.1%}，处于一段连续回落之后。")
+
+    # 4）价格在本月高低点区间的位置
+    if pd.notna(month_pct):
+        if month_pct > 0.8:
+            lines.append("当前价格接近本周期区间高位，上方空间相对有限，追高风险上升。")
+        elif month_pct < 0.2:
+            lines.append("当前价格接近本周期区间低位，下方空间相对有限，左侧布局意愿会增强。")
+
+    # 5）技术细节：RSI / ADX / 波动率
     if pd.notna(rsi):
         if rsi < 30:
             lines.append("RSI 已进入超卖区域，左侧抄底资金可能开始活跃。")
@@ -695,17 +742,15 @@ st.sidebar.markdown("---")
 st.sidebar.caption("本工具仅作量化分析与回测示范，不涉及真实资金与下单。")
 
 # =========================
-# 数据获取 + 显示北京时间
-# =========================
-
-# =========================
 # 数据获取 + 显示“抓取时间”（北京时间）
 # =========================
 
 # 记录真正的抓取时间（UTC）
 fetch_time_utc = pd.Timestamp.utcnow().tz_localize("UTC")
 
-status_box = st.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据……")
+# 用占位容器来更新状态（避免用 st.info() 返回值调用 .success 这种错误）
+status = st.empty()
+status.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据……")
 
 dfs = {}
 for tf in TIMEFRAMES:
@@ -716,7 +761,7 @@ for tf in TIMEFRAMES:
     dfs[tf] = fetch_okx_klines(selected_pair, tf, limit=limit)
 
 if any((df is None or df.empty) for df in dfs.values()):
-    status_box.error("部分周期数据获取失败，请稍后重试或检查网络。")
+    status.error("部分周期数据获取失败，请稍后重试或检查网络。")
     st.error("❌ 数据获取失败。")
     st.stop()
 
@@ -724,24 +769,22 @@ main_df = dfs[MAIN_TIMEFRAME]
 
 # 把抓取时间和最新K线时间都转成北京时间展示
 try:
-    # 抓取时间
     bj_fetch = fetch_time_utc.tz_convert("Asia/Shanghai")
     fetch_str = bj_fetch.strftime("%Y年%m月%d日 %H:%M:%S")
 
-    # 最新主周期K线时间（OKX 通常是 UTC 时间戳）
     last_ts = main_df.index[-1]
     if last_ts.tzinfo is None:
         last_ts = last_ts.tz_localize("UTC")
     bj_kline = last_ts.tz_convert("Asia/Shanghai")
     kline_str = bj_kline.strftime("%Y年%m月%d日 %H:%M:%S")
 
-    status_box.success(
+    status.success(
         f"已从 OKX 获取 {selected_pair} 多周期数据。"
         f" 抓取时间：{fetch_str}（北京时间），"
         f"最新 {MAIN_TIMEFRAME} K 线时间：{kline_str}（北京时间）"
     )
 except Exception:
-    status_box.success(f"已从 OKX 获取 {selected_pair} 多周期数据。")
+    status.success(f"已从 OKX 获取 {selected_pair} 多周期数据。")
 
 fg = fetch_fear_greed()
 global_mkt = fetch_global_market()
@@ -828,23 +871,38 @@ else:
     table = tf_signals.copy()
     table["方向"] = table["direction"].fillna("观望")
 
+    # 构造展示列（含近 N 根涨跌幅 + 本月高低点百分位）
     table_show = table[[
         "price", "trend_score", "reversal_score", "volatility_score",
-        "composite_score", "rsi", "adx", "方向", "stop_loss", "take_profit"
+        "composite_score", "rsi", "adx", "方向",
+        "stop_loss", "take_profit",
+        "period_return", "month_percentile"
     ]]
 
+    ret_col = f"近{PERIOD_RET_LOOKBACK}根涨跌幅"
+    month_col = "本月高低点百分位"
+
+    table_show = table_show.rename(columns={
+        "period_return": ret_col,
+        "month_percentile": month_col
+    })
+
+    fmt_dict = {
+        "price": "{:.4f}",
+        "trend_score": "{:.1f}",
+        "reversal_score": "{:.1f}",
+        "volatility_score": "{:.1f}",
+        "composite_score": "{:.1f}",
+        "rsi": "{:.1f}",
+        "adx": "{:.1f}",
+        "stop_loss": "{:.4f}",
+        "take_profit": "{:.4f}",
+        ret_col: "{:.2%}",
+        month_col: "{:.1%}"
+    }
+
     st.dataframe(
-        table_show.style.format({
-            "price": "{:.4f}",
-            "trend_score": "{:.1f}",
-            "reversal_score": "{:.1f}",
-            "volatility_score": "{:.1f}",
-            "composite_score": "{:.1f}",
-            "rsi": "{:.1f}",
-            "adx": "{:.1f}",
-            "stop_loss": "{:.4f}",
-            "take_profit": "{:.4f}"
-        }),
+        table_show.style.format(fmt_dict),
         use_container_width=True
     )
 
@@ -1124,4 +1182,3 @@ st.caption("""
 模型基于历史数据与技术因子，无法保证未来表现。  
 加密货币波动性极高，请谨慎决策，严格止损。
 """)
-
