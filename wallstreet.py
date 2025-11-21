@@ -637,18 +637,87 @@ class MultiFrameChiefAnalyst:
 # ============================================================
 
 def render_signal_card(sig: Optional[SignalExplanation]):
-    """
-    统一修复：每个卡片的 HTML 都是：
-    <div class="quant-card">
-      <div class="quant-header">...</div>
-      <div class="logic-list">...</div>
-      [plan-box]
-      [backtest-box]
-    </div>
-    只开这 3 层，最后只关 1 个 quant-card，不会再出现多余 </div></div>
-    """
     if sig is None:
         st.markdown("<div class='quant-card'>该周期数据不足，暂不输出观点。</div>", unsafe_allow_html=True)
+        return
+
+    # 标签颜色
+    if "多" in sig.bias:
+        tag_class = "tag-bull"
+    elif "空" in sig.bias:
+        tag_class = "tag-bear"
+    else:
+        tag_class = "tag-neutral"
+
+    # 头部 + 开启 logic-list 容器
+    header = f"""
+    <div class="quant-card">
+      <div class="quant-header">
+        <div class="quant-title">{sig.timeframe}</div>
+        <div class="quant-tag {tag_class}">{sig.bias} · 信心 {sig.conviction:.0f}/100</div>
+      </div>
+      <div class="logic-list">
+    """
+
+    # 逻辑点
+    logic_html = "".join(
+        f"<div class='logic-item'><div class='logic-bullet'>•</div><div>{r}</div></div>"
+        for r in sig.reasons
+    )
+
+    # 止盈止损块
+    if sig.stop_loss is not None and sig.take_profit_1 is not None:
+        dir_word = "做多" if sig.long_score > sig.short_score else "做空"
+        dir_class = "bull" if dir_word == "做多" else "bear"
+        rr1 = f"{sig.reward_risk_1:.1f}R" if sig.reward_risk_1 else "—"
+        rr2 = f"{sig.reward_risk_2:.1f}R" if sig.reward_risk_2 else "—"
+
+        plan_html = f"""
+        <div class="plan-box">
+            <div class="plan-row">
+                <span class="plan-label">执行方向</span>
+                <span class="plan-value {dir_class}">{dir_word}</span>
+            </div>
+            <div class="plan-row">
+                <span class="plan-label">战术入场</span>
+                <span class="plan-value">${sig.entry_hint:,.4f}</span>
+            </div>
+            <div class="plan-row">
+                <span class="plan-label">防守止损</span>
+                <span class="plan-value bear">${sig.stop_loss:,.4f}</span>
+            </div>
+            <div class="plan-row">
+                <span class="plan-label">止盈一档</span>
+                <span class="plan-value bull">${sig.take_profit_1:,.4f} · {rr1}</span>
+            </div>
+            <div class="plan-row">
+                <span class="plan-label">止盈二档</span>
+                <span class="plan-value bull">${sig.take_profit_2:,.4f} · {rr2}</span>
+            </div>
+        </div>
+        """
+    else:
+        plan_html = "<div class='plan-box'>本周期仅给出方向性参考，不建议机械挂单。</div>"
+
+    # 回测块（关键：这是普通 HTML 字符串，不是 markdown 代码块）
+    if sig.bt_trades > 0 and sig.bt_winrate is not None:
+        win = sig.bt_winrate * 100
+        rr = sig.bt_avg_rr
+        bt_html = f"""
+        <div class="backtest-box">
+            历史回测（最近 {sig.bt_trades} 笔模拟信号）：<br/>
+            · 胜率约：<b>{win:.1f}%</b> · 平均每笔期望：<b>{rr:.2f}R</b><br/>
+            <span style="color:#9ca3af;">这不是预测未来，而是在告诉你：这套打分在过去<b>大致有统计优势</b>。</span>
+        </div>
+        """
+    else:
+        bt_html = ""
+
+    # 只关闭 logic-list 和 quant-card 这两层
+    tail = "</div></div>"
+
+    # 整体一次性输出，开启 unsafe_allow_html，防止当成“代码”渲染
+    st.markdown(header + logic_html + plan_html + bt_html + tail, unsafe_allow_html=True)
         return
 
     if "多" in sig.bias:
@@ -1002,3 +1071,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
