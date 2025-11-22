@@ -43,10 +43,33 @@ FEE_RATE = 0.0005           # 手续费假设（单边 0.05%）
 MIN_BARS_FOR_FACTORS = 60   # 起码要有这么多K线才算有因子
 INIT_CAPITAL = 10000.0      # 回测虚拟初始资金（页面不展示）
 
+# ==== 固定策略参数（更稳妥，不激进） ====
+# 综合评分 ≥ LONG_THRESHOLD → 多头；≤ SHORT_THRESHOLD → 空头
+LONG_THRESHOLD = 30
+SHORT_THRESHOLD = -30
+
+# 止盈止损 ATR 倍数
+ATR_SL_MULT = 2.0
+ATR_TP_MULT = 3.0
+
+# 回测：单笔风险占比、回测天数、最大持仓K线数、盈亏分布显示最近 N 笔
+RISK_FRACTION = 0.02
+BACKTEST_DAYS = 90
+MAX_HOLDING_BARS = 40
+N_HIST_TRADES = 100
+
 # 本周期最近 N 根涨跌幅
 PERIOD_RET_LOOKBACK = 20
 # “本月高低点百分位”的窗口（用近 30 天近似）
 MONTH_WINDOW_DAYS = 30
+
+# 用于经验概率分析：每个周期前瞻多少根 K 线
+PROB_HORIZON_BARS = {
+    "15m": 8,   # 约 2 小时
+    "1h": 6,    # 约 6 小时
+    "4h": 6,    # 约 1 天
+    "1d": 3     # 约 3 天
+}
 
 # 时间框架说明（卡片用）
 TF_DESC = {
@@ -183,7 +206,7 @@ def fetch_global_market():
 
 
 # =========================
-# 多因子计算
+# 多因子计算 & 新增统计方法
 # =========================
 
 def compute_factor_series(df: pd.DataFrame) -> pd.DataFrame:
@@ -292,6 +315,65 @@ def aggregate_score(factor_table: pd.DataFrame, weights: dict) -> float:
     return float(s / w_sum)
 
 
+def compute_forward_prob_stats(df: pd.DataFrame, fac: pd.DataFrame,
+                               horizon: int, score_window: float = 10.0,
+                               min_samples: int = 40):
+    """
+    经验概率模块：
+    给定因子序列 & K线，估计：
+    - 当前得分附近（±score_window）在历史上的样本
+    - 未来 horizon 根 K 线的经验上涨概率 / 期望收益等
+    """
+    if df is None or fac is None:
+        return None
+    if len(df) <= horizon + 5:
+        return None
+    if "composite_score" not in fac.columns:
+        return None
+
+    scores = fac["composite_score"]
+    closes = df["close"]
+
+    # 未来 horizon 根的收益：对前 len-horizon 根有效
+    fwd_ret = (closes.shift(-horizon) / closes - 1).iloc[:-horizon]
+    scores_hist = scores.iloc[:-horizon]
+
+    mask = scores_hist.notna() & fwd_ret.notna()
+    scores_hist = scores_hist[mask]
+    fwd_ret = fwd_ret[mask]
+
+    if len(fwd_ret) < min_samples:
+        return None
+
+    score_now = scores.iloc[-1]
+    if pd.isna(score_now):
+        return None
+
+    similar = scores_hist.between(score_now - score_window, score_now + score_window)
+    if similar.sum() >= min_samples:
+        rets = fwd_ret[similar]
+        n = similar.sum()
+    else:
+        rets = fwd_ret
+        n = len(fwd_ret)
+
+    if n == 0:
+        return None
+
+    prob_up = (rets > 0).mean()
+    exp_ret = rets.mean()
+    worst_10 = rets.quantile(0.1)
+    best_10 = rets.quantile(0.9)
+
+    return {
+        "prob_up": float(prob_up),
+        "exp_ret": float(exp_ret),
+        "worst_10": float(worst_10),
+        "best_10": float(best_10),
+        "n_samples": int(n)
+    }
+
+
 def build_multi_tf_signals(
     inst_id: str,
     dfs: dict,
@@ -307,6 +389,8 @@ def build_multi_tf_signals(
     - 止盈止损点位
     - 本周期最近 N 根的涨跌幅
     - 当前价格在近 MONTH_WINDOW_DAYS 天高低点区间的百分位
+    - 当前综合得分在本周期历史中的分位数（动态评估）
+    - 基于历史的经验上涨概率 & 期望收益
     """
     rows = []
     for tf, df in dfs.items():
@@ -318,7 +402,7 @@ def build_multi_tf_signals(
         atr = float(last["atr"]) if not np.isnan(last["atr"]) else None
         score = float(last["composite_score"])
 
-        # 方向 & 止盈止损
+        # 方向 & 止盈止损（保守阈值）
         direction = None
         sl = None
         tp = None
@@ -354,6 +438,25 @@ def build_multi_tf_signals(
         else:
             month_pct = np.nan
 
+        # 动态评分分位数
+        hist_scores = fac["composite_score"].dropna()
+        if len(hist_scores) >= 60:
+            q25, q50, q75 = hist_scores.quantile([0.25, 0.5, 0.75])
+            score_pct = (hist_scores < score).mean()  # 当前得分在历史中的经验分位
+        else:
+            q25 = q75 = score_pct = np.nan
+
+        # 经验概率统计
+        horizon = PROB_HORIZON_BARS.get(tf, 5)
+        prob_stats = compute_forward_prob_stats(df, fac, horizon=horizon)
+        if prob_stats is not None:
+            prob_up = prob_stats["prob_up"]
+            exp_ret = prob_stats["exp_ret"]
+            n_samples = prob_stats["n_samples"]
+        else:
+            prob_up = exp_ret = np.nan
+            n_samples = 0
+
         rows.append({
             "timeframe": tf,
             "price": price,
@@ -369,7 +472,13 @@ def build_multi_tf_signals(
             "stop_loss": sl,
             "take_profit": tp,
             "period_return": period_ret,
-            "month_percentile": month_pct
+            "month_percentile": month_pct,
+            "score_percentile": score_pct,
+            "dyn_long_thr": q75,
+            "dyn_short_thr": q25,
+            "prob_up": prob_up,
+            "exp_ret": exp_ret,
+            "prob_n": n_samples
         })
 
     if not rows:
@@ -385,11 +494,51 @@ def build_multi_tf_signals(
     return df_tf
 
 
+def detect_regime_main(fac: pd.DataFrame):
+    """
+    基于主周期因子（4h），检测当前市场状态 Regime：
+    - 趋势市 / 低波震荡市 / 高波动混乱市 / 过渡阶段
+    """
+    if fac is None or fac.empty:
+        return "未知", "因子数据不足，暂时无法判断市场状态。"
+
+    last = fac.iloc[-1]
+    trend = last.get("trend_score", np.nan)
+    adx = last.get("adx", np.nan)
+    vol_score = last.get("volatility_score", np.nan)
+
+    if pd.isna(trend) or pd.isna(adx) or pd.isna(vol_score):
+        return "未知", "关键因子存在缺失值，暂时无法判断市场状态。"
+
+    at = abs(trend)
+    av = abs(vol_score)
+
+    # 简单规则：可以后续再细化
+    if at > 20 and adx > 25:
+        regime = "趋势市"
+        comment = "当前 4h 呈明显单边趋势，顺势信号的统计优势通常更好，逆势博弈需要格外谨慎。"
+    elif at < 10 and adx < 18 and av < 10:
+        regime = "低波震荡市"
+        comment = "当前 4h 趋势不强、波动有限，更偏向箱体震荡环境，均值回归/区间交易相对占优。"
+    elif av > 20:
+        regime = "高波动混乱市"
+        comment = "当前 4h 波动率显著放大，方向噪声较多，建议控制杠杆和单笔风险，等待结构更清晰再重仓。"
+    else:
+        regime = "过渡阶段"
+        comment = "当前 4h 介于趋势与震荡之间，处于方向酝酿期，信号可靠性有限，可适度减仓观望。"
+
+    return regime, comment
+
+
 def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
                        long_thr: float, short_thr: float) -> list:
     """
     为单个周期卡片生成“有逻辑的分析语句”，
-    结合：本周期因子 + 与 4h、1d 的多空关系 + 近 N 根涨跌 + 本月百分位。
+    结合：
+    - 本周期因子
+    - 与 4h、1d 的多空关系
+    - 近 N 根涨跌 + 本月百分位
+    - 评分在历史中的分位 & 经验上涨概率
     """
     lines = []
 
@@ -401,6 +550,9 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
     vol_score = row["volatility_score"]
     period_ret = row.get("period_return", np.nan)
     month_pct = row.get("month_percentile", np.nan)
+    score_pct = row.get("score_percentile", np.nan)
+    prob_up = row.get("prob_up", np.nan)
+    exp_ret = row.get("exp_ret", np.nan)
 
     dir_4h = tf_signals.loc[MAIN_TIMEFRAME, "direction"] if MAIN_TIMEFRAME in tf_signals.index else None
     dir_1d = tf_signals.loc["1d", "direction"] if "1d" in tf_signals.index else None
@@ -464,7 +616,20 @@ def build_card_comment(tf: str, row: pd.Series, tf_signals: pd.DataFrame,
         elif month_pct < 0.2:
             lines.append("当前价接近近期低位，左侧布局意愿会增强。")
 
-    # 5）技术细节：RSI / ADX / 波动率
+    # 5）评分在本周期历史中的分位数
+    if pd.notna(score_pct):
+        lines.append(f"当前综合评分约高于本周期历史 {score_pct:.1%} 的时间，属于{'偏极端' if score_pct > 0.8 or score_pct < 0.2 else '中等偏'}水平。")
+
+    # 6）经验上涨概率 & 期望收益
+    if pd.notna(prob_up) and pd.notna(exp_ret):
+        if prob_up > 0.55:
+            lines.append(f"在历史上与当前得分相近的情形中，未来同周期约 {prob_up:.1%} 的概率上涨，平均收益约 {exp_ret:.2%}。")
+        elif prob_up < 0.45:
+            lines.append(f"在历史上与当前得分相近的情形中，未来同周期上涨概率仅约 {prob_up:.1%}，平均收益约 {exp_ret:.2%}。")
+        else:
+            lines.append(f"历史上相似得分后的涨跌概率接近五五开，平均收益约 {exp_ret:.2%}，统计优势并不明显。")
+
+    # 7）技术细节：RSI / ADX / 波动率
     if pd.notna(rsi):
         if rsi < 30:
             lines.append("RSI 已进入超卖区域，可能存在反弹博弈机会。")
@@ -662,82 +827,15 @@ st.set_page_config(
 )
 
 st.title("📈 华尔街级加密量化分析助手 · 多周期因子 & 回测")
-st.caption("实时 OKX 行情 · 多周期因子模型 · 机械回测 · 纯分析，不接实盘")
+st.caption("实时 OKX 行情 · 多周期因子模型 · 统计分析 · 纯分析，不接实盘")
 
-# 侧边栏：策略配置
-st.sidebar.header("🔧 策略与回测参数")
-
+# 侧边栏：只保留币种选择
+st.sidebar.header("⚙️ 设置")
 selected_pair = st.sidebar.selectbox(
     "选择交易对（OKX 现货）",
     DEFAULT_PAIRS,
     index=0
 )
-
-long_threshold = st.sidebar.slider(
-    "做多信号阈值（综合评分 ≥）",
-    min_value=10,
-    max_value=80,
-    value=30,
-    step=5
-)
-
-short_threshold = st.sidebar.slider(
-    "做空信号阈值（综合评分 ≤）",
-    min_value=-80,
-    max_value=-10,
-    value=-30,
-    step=5
-)
-
-atr_sl_mult = st.sidebar.slider(
-    "ATR 止损倍数",
-    min_value=0.5,
-    max_value=5.0,
-    value=2.0,
-    step=0.1
-)
-
-atr_tp_mult = st.sidebar.slider(
-    "ATR 止盈倍数",
-    min_value=0.5,
-    max_value=8.0,
-    value=3.0,
-    step=0.1
-)
-
-risk_fraction = st.sidebar.slider(
-    "【仅用于回测】单笔风险占比",
-    min_value=0.005,
-    max_value=0.05,
-    value=0.02,
-    step=0.005,
-    format="%.3f"
-)
-
-backtest_days = st.sidebar.slider(
-    "回测区间（按主周期 4h，近多少天）",
-    min_value=30,
-    max_value=365,
-    value=90,
-    step=15
-)
-
-max_holding_bars = st.sidebar.slider(
-    "最大持仓K线数（时间止盈）",
-    min_value=5,
-    max_value=200,
-    value=40,
-    step=5
-)
-
-n_hist_trades = st.sidebar.slider(
-    "最近 N 笔交易用于盈亏分布",
-    min_value=20,
-    max_value=300,
-    value=100,
-    step=10
-)
-
 st.sidebar.markdown("---")
 st.sidebar.caption("本工具仅作量化分析与回测示范，不涉及真实资金与下单。")
 
@@ -745,7 +843,6 @@ st.sidebar.caption("本工具仅作量化分析与回测示范，不涉及真实
 # 数据获取 + 显示“抓取时间”（北京时间）
 # =========================
 
-# ✅ 修复点：直接拿带时区的现在时间，避免 tz_localize 冲突
 fetch_time_utc = pd.Timestamp.now(tz="UTC")
 
 status = st.empty()
@@ -754,7 +851,7 @@ status.info(f"正在从 OKX 获取 {selected_pair} 的多周期行情数据…�
 dfs = {}
 for tf in TIMEFRAMES:
     if tf == MAIN_TIMEFRAME:
-        limit = estimate_bars(tf, backtest_days)
+        limit = estimate_bars(tf, BACKTEST_DAYS)
     else:
         limit = 400
     dfs[tf] = fetch_okx_klines(selected_pair, tf, limit=limit)
@@ -766,7 +863,6 @@ if any((df is None or df.empty) for df in dfs.values()):
 
 main_df = dfs[MAIN_TIMEFRAME]
 
-# 把抓取时间和最新K线时间都转成北京时间展示
 try:
     bj_fetch = fetch_time_utc.tz_convert("Asia/Shanghai")
     fetch_str = bj_fetch.strftime("%Y年%m月%d日 %H:%M:%S")
@@ -791,13 +887,16 @@ global_mkt = fetch_global_market()
 # 预先计算多周期信号 & 主周期因子
 tf_signals = build_multi_tf_signals(
     selected_pair, dfs,
-    long_threshold, short_threshold,
-    atr_sl_mult, atr_tp_mult
+    LONG_THRESHOLD, SHORT_THRESHOLD,
+    ATR_SL_MULT, ATR_TP_MULT
 )
 fac_main = compute_factor_series(main_df)
 
+# 主周期 Regime 检测
+regime_label, regime_comment = detect_regime_main(fac_main)
+
 # =========================
-# 顶部：四个小卡片 + 多周期综述
+# 顶部：多周期综述 + Regime
 # =========================
 
 st.subheader("🎯 多周期核心信号总览")
@@ -806,8 +905,22 @@ if tf_signals.empty:
     st.warning("因子数据不足，暂时无法生成多周期信号。")
 else:
     overall_score = aggregate_score(tf_signals, TF_WEIGHTS)
-    overall_bias = score_to_bias(overall_score, long_threshold, short_threshold)
-    st.metric("多周期综合评分（加权）", f"{overall_score:.1f}", overall_bias)
+    overall_bias = score_to_bias(overall_score, LONG_THRESHOLD, SHORT_THRESHOLD)
+
+    col_top1, col_top2 = st.columns([1, 2])
+    with col_top1:
+        st.metric("多周期综合评分（加权）", f"{overall_score:.1f}", overall_bias)
+    with col_top2:
+        color = "#16c784" if regime_label == "趋势市" else "#ea3943" if regime_label == "高波动混乱市" else "#f0ad4e"
+        st.markdown(
+            f"""
+            <div style="border-radius:8px; border:1px solid {color}; padding:8px; background-color:#050505;">
+                <span style="color:{color}; font-weight:bold;">当前 4h 市场状态：{regime_label}</span><br>
+                <span style="color:#dddddd; font-size:12px;">{regime_comment}</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
     available_tfs = [tf for tf in TIMEFRAMES if tf in tf_signals.index]
     cols = st.columns(len(available_tfs))
@@ -832,7 +945,7 @@ else:
         sl_str = f"{sl:.4f}" if pd.notna(sl) else "—"
         tp_str = f"{tp:.4f}" if pd.notna(tp) else "—"
 
-        comment_lines = build_card_comment(tf, row, tf_signals, long_threshold, short_threshold)
+        comment_lines = build_card_comment(tf, row, tf_signals, LONG_THRESHOLD, SHORT_THRESHOLD)
         explain_html = "<br>".join(comment_lines)
 
         with col:
@@ -862,7 +975,7 @@ else:
 # 多周期详细指标 & 风格剖面
 # =========================
 
-st.subheader("📊 多周期详细指标 & 风格剖面")
+st.subheader("📊 多周期详细指标 & 统计风格剖面")
 
 if tf_signals.empty:
     st.info("暂无多周期详细指标。")
@@ -870,20 +983,26 @@ else:
     table = tf_signals.copy()
     table["方向"] = table["direction"].fillna("观望")
 
-    # 构造展示列（含近 N 根涨跌幅 + 本月高低点百分位）
     table_show = table[[
         "price", "trend_score", "reversal_score", "volatility_score",
         "composite_score", "rsi", "adx", "方向",
         "stop_loss", "take_profit",
-        "period_return", "month_percentile"
+        "period_return", "month_percentile",
+        "score_percentile", "prob_up", "exp_ret"
     ]]
 
     ret_col = f"近{PERIOD_RET_LOOKBACK}根涨跌幅"
     month_col = "本月高低点百分位"
+    score_pct_col = "当前评分分位"
+    prob_up_col = "经验上涨概率"
+    exp_ret_col = "经验期望收益"
 
     table_show = table_show.rename(columns={
         "period_return": ret_col,
-        "month_percentile": month_col
+        "month_percentile": month_col,
+        "score_percentile": score_pct_col,
+        "prob_up": prob_up_col,
+        "exp_ret": exp_ret_col
     })
 
     fmt_dict = {
@@ -897,7 +1016,10 @@ else:
         "stop_loss": "{:.4f}",
         "take_profit": "{:.4f}",
         ret_col: "{:.2%}",
-        month_col: "{:.1%}"
+        month_col: "{:.1%}",
+        score_pct_col: "{:.1%}",
+        prob_up_col: "{:.1%}",
+        exp_ret_col: "{:.2%}"
     }
 
     st.dataframe(
@@ -942,7 +1064,7 @@ else:
     st.plotly_chart(radar_fig, use_container_width=True)
 
 # =========================
-# 中部：K线图（放在分析下面）
+# 中部：K线图
 # =========================
 
 st.markdown("---")
@@ -1010,24 +1132,24 @@ st.plotly_chart(fig_k, use_container_width=True)
 # =========================
 
 st.markdown("---")
-st.subheader(f"📈 机械执行回测：过去 {backtest_days} 天（主周期 {MAIN_TIMEFRAME}）")
+st.subheader(f"📈 机械执行回测：过去 {BACKTEST_DAYS} 天（主周期 {MAIN_TIMEFRAME}）")
 
-cutoff = main_df.index[-1] - timedelta(days=backtest_days)
+cutoff = main_df.index[-1] - timedelta(days=BACKTEST_DAYS)
 bt_df = main_df[main_df.index >= cutoff]
 
 if len(bt_df) < MIN_BARS_FOR_FACTORS + 10:
-    st.warning("主周期数据长度不足，无法进行有效回测。请尝试缩短回测区间。")
+    st.warning("主周期数据长度不足，无法进行有效回测。")
 else:
     with st.spinner("正在运行历史回测引擎（纯模拟、不接实盘）……"):
         equity, trades = backtest_on_dataframe(
             bt_df,
-            long_threshold,
-            short_threshold,
-            atr_sl_mult,
-            atr_tp_mult,
+            LONG_THRESHOLD,
+            SHORT_THRESHOLD,
+            ATR_SL_MULT,
+            ATR_TP_MULT,
             INIT_CAPITAL,
-            risk_fraction,
-            max_holding_bars=max_holding_bars
+            RISK_FRACTION,
+            max_holding_bars=MAX_HOLDING_BARS
         )
 
     if equity is None or trades is None or trades.empty:
@@ -1074,8 +1196,8 @@ else:
         )
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        st.subheader(f"📊 最近 {n_hist_trades} 笔信号的盈亏分布")
-        trades_hist = trades.tail(n_hist_trades)
+        st.subheader(f"📊 最近 {N_HIST_TRADES} 笔信号的盈亏分布")
+        trades_hist = trades.tail(N_HIST_TRADES)
         fig_hist = px.histogram(
             trades_hist,
             x="pnl",
