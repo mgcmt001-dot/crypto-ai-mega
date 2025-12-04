@@ -5,24 +5,24 @@ import numpy as np
 
 # ============ Streamlit 基本设置 ============
 st.set_page_config(
-    page_title="主流币短线波动多空终端（升级版）",
+    page_title="主流币短线波动多空终端（多周期·信号打分）",
     layout="wide"
 )
 
-st.title("主流币 1–2 天短线波动多空终端（OKX · 升级版）")
+st.title("主流币 1–2 天短线波动多空终端 · 多周期信号打分版")
 st.caption("仅供量化研究与教学使用，不构成任何投资建议。请理性使用杠杆。")
 
 BASE_URL = "https://www.okx.com"
 
 
-# ============ 数据 & 技术指标函数 ============
+# ============ 工具函数 & 技术指标 ============
 
 @st.cache_data(show_spinner=False)
 def fetch_okx_candles(inst_id: str, bar: str = "1H", limit: int = 500) -> pd.DataFrame:
     """
     从 OKX 获取 K 线数据
     inst_id: 'BTC-USDT-SWAP' 等
-    bar: '1H','4H','1D'...
+    bar: '1H','4H','1D','15m'...
     """
     url = f"{BASE_URL}/api/v5/market/candles"
     params = {"instId": inst_id, "bar": bar, "limit": limit}
@@ -90,37 +90,33 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"] = atr(df, 14)
     df["bb_mid"], df["bb_upper"], df["bb_lower"] = bollinger_bands(close, 20, 2.0)
 
-    # 为风格剖面预先计算两个因子
-    df["trend_strength"] = (
-        (df["ema_fast"] - df["ema_slow"]).abs() / (df["atr"] + 1e-9)
-    )
-    df["bb_width"] = (
-        (df["bb_upper"] - df["bb_lower"]) / (df["bb_mid"] + 1e-9)
-    )
+    # 风格因子
+    df["trend_strength"] = (df["ema_fast"] - df["ema_slow"]).abs() / (df["atr"] + 1e-9)
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / (df["bb_mid"] + 1e-9)
 
     return df
 
 
-# ============ 市场状态识别 & 信号生成 ============
+# ============ Regime 识别 & 信号生成 ============
 
 def classify_regime(row: pd.Series) -> str:
     """
-    基于单根K线的指标，判断市场状态：
+    市场状态：
     - 'trend'          : 趋势市
     - 'squeeze'        : 压缩待爆发
     - 'mean_reversion' : 震荡均值回归
     """
     if (
-        np.isnan(row["atr"]) or row["atr"] <= 0
-        or np.isnan(row["trend_strength"])
-        or np.isnan(row["bb_width"]) or row["bb_mid"] <= 0
+        np.isnan(row.get("atr", np.nan)) or row["atr"] <= 0
+        or np.isnan(row.get("trend_strength", np.nan))
+        or np.isnan(row.get("bb_width", np.nan))
+        or np.isnan(row.get("bb_mid", np.nan)) or row["bb_mid"] <= 0
     ):
         return "unknown"
 
     ts = row["trend_strength"]
     bbw = row["bb_width"]
 
-    # 这些阈值是经验值，可按回测结果微调
     if bbw < 0.02:
         return "squeeze"
     elif ts > 1.5 and bbw > 0.02:
@@ -136,10 +132,7 @@ def gen_short_term_signal(
     max_hold_meanrev: int = 24,
 ):
     """
-    对整段历史生成信号（用于回测），并对最新一根给出当前建议。
-    返回：
-      signals_df: 每根K线的信号信息
-      latest_signal: 最新一根K线的信号 dict
+    基于 1H 生成整段历史信号 & 最新信号
     """
     df = df.copy()
     n = len(df)
@@ -189,7 +182,7 @@ def gen_short_term_signal(
                 reason = "价格突破近24根高点 + 趋势向上 + RSI偏强"
                 sl_mult = 1.8 if regime == "trend" else 1.5
                 sl = entry - sl_mult * atr_val
-                tp = entry + 2 * (entry - sl)  # R:R=1:2
+                tp = entry + 2 * (entry - sl)
                 max_hold = max_hold_trend
 
             # 空头突破
@@ -250,15 +243,9 @@ def gen_short_term_signal(
     return signals, latest_row
 
 
-# ============ 回测 ============
+# ============ 回测 & 统计 ============
 
 def backtest_short_term(df: pd.DataFrame, signals_df: pd.DataFrame):
-    """
-    基于 gen_short_term_signal 生成的信号做简单回测。
-    - 在信号出现的那根K线收盘价开仓
-    - 后续K线内检查 high/low 是否触及止盈/止损/超时
-    - 单位为 R（止损距离为 1R）
-    """
     trades = []
     in_pos = False
     direction = None
@@ -280,7 +267,6 @@ def backtest_short_term(df: pd.DataFrame, signals_df: pd.DataFrame):
         sig = signals_df.loc[t]
 
         if not in_pos:
-            # 新信号
             side = sig.get("side", "flat")
             if side in ["long", "short"]:
                 if np.isnan(sig["sl"]) or np.isnan(sig["tp"]):
@@ -296,7 +282,6 @@ def backtest_short_term(df: pd.DataFrame, signals_df: pd.DataFrame):
                 signal_type = sig.get("signal_type", "unknown")
                 entry_regime = sig.get("regime", "unknown")
         else:
-            # 持仓中
             bars_held += 1
             high = row["high"]
             low = row["low"]
@@ -356,7 +341,6 @@ def backtest_short_term(df: pd.DataFrame, signals_df: pd.DataFrame):
     else:
         trades_df = pd.DataFrame(trades)
 
-    # 资金曲线（假设每笔风险=资金1%，R≈1%）
     if trades_df.empty:
         equity_curve = None
     else:
@@ -393,11 +377,6 @@ def summarize_trades(trades_df: pd.DataFrame):
 
 
 def summarize_trades_by_type(trades_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    拆分到不同 signal_type 看表现：
-    - breakout_trend
-    - mean_reversion
-    """
     if trades_df.empty:
         return pd.DataFrame(columns=[
             "signal_type", "total_trades", "win_rate",
@@ -407,46 +386,32 @@ def summarize_trades_by_type(trades_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for sig_type, sub in trades_df.groupby("signal_type"):
         stats = summarize_trades(sub)
-        rows.append({
-            "signal_type": sig_type,
-            **stats
-        })
+        rows.append({"signal_type": sig_type, **stats})
     return pd.DataFrame(rows)
 
 
-# ============ 资产级综合打分（0–100） ============
+# ============ 资产级打分（0–100） ============
 
 def compute_asset_score(stats: dict, trades_df: pd.DataFrame) -> float:
-    """
-    按机构视角给一个 0–100 的综合评分：
-    - 胜率（越高越好）
-    - 平均R（>0最好）
-    - 最大回撤（越小越好）
-    - 最近20笔平均R（衡量当前“状态”）
-    - 交易样本数量（样本太少自动打折）
-    """
-    if not stats or "total_trades" not in stats or stats["total_trades"] == 0:
+    if not stats or stats.get("total_trades", 0) == 0:
         return 0.0
 
     total = stats["total_trades"]
-    win_rate = stats["win_rate"]        # 0 ~ 1
-    avg_r = stats["avg_r"]              # 可正可负
-    max_dd = stats["max_drawdown"]      # 负数为主
+    win_rate = stats["win_rate"]
+    avg_r = stats["avg_r"]
+    max_dd = stats["max_drawdown"]
 
-    # 最近表现
     if len(trades_df) >= 5:
         recent = trades_df.tail(20)
         recent_avg_r = recent["r"].mean()
     else:
         recent_avg_r = 0.0
 
-    # 将各维度映射到 0~1 区间（用 tanh 做平滑）
-    win_score = win_rate  # 已是0~1
-    r_score = 0.5 + 0.5 * np.tanh(avg_r / 1.0)          # 大致 (-∞,∞)->(0,1)
+    win_score = win_rate
+    r_score = 0.5 + 0.5 * np.tanh(avg_r / 1.0)
     recent_score = 0.5 + 0.5 * np.tanh(recent_avg_r / 1.0)
-    dd_score = 0.5 + 0.5 * np.tanh(-max_dd / 0.3)       # 回撤越大，得分越低
+    dd_score = 0.5 + 0.5 * np.tanh(-max_dd / 0.3)
 
-    # 样本数量惩罚：小样本打折
     min_trades = 20
     size_factor = min(1.0, total / min_trades)
 
@@ -460,7 +425,7 @@ def compute_asset_score(stats: dict, trades_df: pd.DataFrame) -> float:
     return float(score_0_1 * 100)
 
 
-# ============ 仓位建议 ============
+# ============ 仓位建议 & 多周期微观趋势 ============
 
 def position_sizing(
     capital_usdt: float,
@@ -468,9 +433,6 @@ def position_sizing(
     entry_price: float,
     stop_price: float,
 ):
-    """
-    现货/单向合约的建议币数
-    """
     if capital_usdt <= 0 or entry_price <= 0 or np.isnan(stop_price):
         return 0.0, 0.0
     risk_amt = capital_usdt * risk_pct
@@ -480,6 +442,88 @@ def position_sizing(
     qty = risk_amt / stop_dist
     notional = qty * entry_price
     return qty, notional
+
+
+def compute_micro_trend(df_15m: pd.DataFrame):
+    """
+    基于 15m 周期给一个“微观趋势”判断:
+    - 上涨 micro_trend: up
+    - 下跌 micro_trend: down
+    - neutral: 中性
+    并返回一个简单得分（-2~+2 左右）
+    """
+    if df_15m is None or df_15m.empty:
+        return "unknown", 0.0
+
+    row = df_15m.iloc[-1]
+    score = 0.0
+
+    if not np.isnan(row.get("ema_fast", np.nan)) and not np.isnan(row.get("ema_slow", np.nan)):
+        if row["ema_fast"] > row["ema_slow"]:
+            score += 1.0
+        elif row["ema_fast"] < row["ema_slow"]:
+            score -= 1.0
+
+    if not np.isnan(row.get("rsi", np.nan)):
+        if row["rsi"] > 55:
+            score += 1.0
+        elif row["rsi"] < 45:
+            score -= 1.0
+
+    if not np.isnan(row.get("bb_mid", np.nan)) and row["bb_mid"] > 0:
+        if row["close"] > row["bb_mid"]:
+            score += 0.5
+        elif row["close"] < row["bb_mid"]:
+            score -= 0.5
+
+    if score > 0.5:
+        return "up", score
+    elif score < -0.5:
+        return "down", score
+    else:
+        return "neutral", score
+
+
+def compute_signal_quality(row_dict: dict) -> float:
+    """
+    0-100 信号质量分：
+    - 策略类型 + Regime -> 基础分
+    - 资产历史打分 -> 加减分
+    - 15m 微观趋势是否与 1H 方向共振 -> 加减分
+    """
+    side = row_dict.get("side", "flat")
+    if side not in ["long", "short"]:
+        return 0.0
+
+    signal_type = row_dict.get("signal_type", "none")
+    regime = row_dict.get("latest_regime", "unknown")
+    asset_score = row_dict.get("asset_score", 50.0)
+    micro_dir = row_dict.get("micro_trend_dir", "neutral")
+    micro_score = row_dict.get("micro_trend_score", 0.0)
+
+    # 1）基础分：趋势突破 > 均值回归
+    if signal_type == "breakout_trend" and regime in ["trend", "squeeze"]:
+        base = 70.0
+    elif signal_type == "breakout_trend":
+        base = 60.0
+    elif signal_type == "mean_reversion":
+        base = 55.0
+    else:
+        base = 50.0
+
+    # 2）资产历史评分（以 50 为中性）
+    asset_term = 0.3 * (asset_score - 50.0)  # ±15 区间
+
+    # 3）15m 微观趋势共振
+    micro_term = 5 * np.tanh(micro_score)  # -5 ~ 5 附近
+    # 若方向与微观趋势明显反向，额外扣分
+    if side == "long" and micro_dir == "down":
+        micro_term -= 10
+    if side == "short" and micro_dir == "up":
+        micro_term -= 10
+
+    raw = base + asset_term + micro_term
+    return float(np.clip(raw, 0.0, 100.0))
 
 
 # ============ Sidebar 参数 ============
@@ -518,44 +562,46 @@ recent_n = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("数据来源：OKX 公共API\n本工具不保证数据完整与实时，实盘前请务必自测。")
+st.sidebar.caption("数据来源：OKX 公共API；本工具不保证数据完整与实时，实盘前请务必自测。")
 
 if not universe:
     st.warning("请在左侧选择至少一个交易标的。")
     st.stop()
 
 
-# ============ 主逻辑：批量获取数据 & 回测 & 打分 ============
+# ============ 主逻辑：多周期 + 回测 + 打分 ============
 
-st.subheader("一、跨品种信号 & 资产级打分（0–100）")
+st.subheader("一、跨品种多周期信号 & 资产级打分（0–100）")
 
 rows = []
 
 for inst in universe:
-    with st.spinner(f"获取 {inst} 1H K 线数据并回测策略..."):
+    with st.spinner(f"获取 {inst} 1H & 15m K 线数据并回测策略..."):
         try:
-            df = fetch_okx_candles(inst, "1H", limit=500)
+            df_1h = fetch_okx_candles(inst, "1H", limit=500)
         except Exception as e:
-            st.error(f"{inst} 数据获取失败: {e}")
+            st.error(f"{inst} 1H 数据获取失败: {e}")
             continue
 
-    df_ind = add_indicators(df)
-    signals_df, latest_sig = gen_short_term_signal(df_ind)
+        try:
+            df_15m = fetch_okx_candles(inst, "15m", limit=200)
+        except Exception:
+            df_15m = None
 
-    # 加一列 regime 到 df 方便后面分析
-    regimes = []
-    for _, r in df_ind.iterrows():
-        regimes.append(classify_regime(r))
-    df_ind["regime"] = regimes
+    df_1h_ind = add_indicators(df_1h)
+    signals_df, latest_sig = gen_short_term_signal(df_1h_ind)
 
-    trades_df, equity_curve = backtest_short_term(df_ind, signals_df)
+    regimes = [classify_regime(r) for _, r in df_1h_ind.iterrows()]
+    df_1h_ind["regime"] = regimes
+
+    trades_df, equity_curve = backtest_short_term(df_1h_ind, signals_df)
     stats = summarize_trades(trades_df)
     asset_score = compute_asset_score(stats, trades_df)
 
-    latest_price = df_ind["close"].iloc[-1]
-    latest_regime = df_ind["regime"].iloc[-1]
+    latest_price = df_1h_ind["close"].iloc[-1]
+    latest_regime = df_1h_ind["regime"].iloc[-1]
 
-    # 当前信号与仓位建议
+    # 当前信号 & 仓位建议（单笔风险）
     side = latest_sig.get("side", "flat")
     entry = latest_sig.get("entry_price", np.nan)
     sl = latest_sig.get("sl", np.nan)
@@ -567,67 +613,73 @@ for inst in universe:
         stop_price=sl,
     )
 
-    # 信号优先级：趋势突破 > 均值回归 > 无
+    # 15m 微观趋势
+    if df_15m is not None and not df_15m.empty:
+        df_15m_ind = add_indicators(df_15m)
+        micro_trend_dir, micro_trend_score = compute_micro_trend(df_15m_ind)
+    else:
+        micro_trend_dir, micro_trend_score = "unknown", 0.0
+
+    # 信号优先级（粗）：趋势突破 > 均值回归 > 无
     if side in ["long", "short"]:
         if latest_sig.get("signal_type") == "breakout_trend" and latest_regime in [
             "trend",
             "squeeze",
         ]:
-            edge_score = 2
+            base_priority = 2
         elif latest_sig.get("signal_type") == "mean_reversion":
-            edge_score = 1
+            base_priority = 1
         else:
-            edge_score = 0
+            base_priority = 0
     else:
-        edge_score = -1
+        base_priority = -1
 
-    rows.append(
-        {
-            "inst": inst,
-            "price": latest_price,
-            "latest_regime": latest_regime,
-            "side": side,
-            "signal_type": latest_sig.get("signal_type", "none"),
-            "reason": latest_sig.get("reason", ""),
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "suggest_qty": qty,
-            "suggest_notional": notion,
-            "signal_priority": edge_score,
-            "asset_score": asset_score,
-            "stats": stats,
-            "trades_df": trades_df,
-            "equity_curve": equity_curve,
-            "df": df_ind,
-            "signals_df": signals_df,
-        }
-    )
+    row = {
+        "inst": inst,
+        "price": latest_price,
+        "latest_regime": latest_regime,
+        "side": side,
+        "signal_type": latest_sig.get("signal_type", "none"),
+        "reason": latest_sig.get("reason", ""),
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "suggest_qty_single": qty,
+        "suggest_notional_single": notion,
+        "signal_priority": base_priority,
+        "asset_score": asset_score,
+        "stats": stats,
+        "trades_df": trades_df,
+        "equity_curve": equity_curve,
+        "df_1h": df_1h_ind,
+        "signals_df": signals_df,
+        "micro_trend_dir": micro_trend_dir,
+        "micro_trend_score": micro_trend_score,
+    }
+    rows.append(row)
 
 if not rows:
     st.error("所有标的的数据都获取失败，请检查网络或 instId 是否正确。")
     st.stop()
 
-# === 组合层面：根据资产级评分 + 信号强度分配风险 ===
-# 策略：只对有信号的品种分配风险，且总风险不超过 portfolio_risk_pct
+# === 计算信号质量分（0-100），再做组合分配 ===
+for r in rows:
+    r["signal_quality"] = compute_signal_quality(r)
+
 signaled = [r for r in rows if r["side"] in ["long", "short"]]
-signaled_sorted = sorted(signaled, key=lambda x: (x["signal_priority"], x["asset_score"]), reverse=True)
+signaled_sorted = sorted(signaled, key=lambda x: x["signal_quality"], reverse=True)
 
 if signaled_sorted:
-    # 最高优先级的前 K 个标的参与组合（简单做法：最多 3 个）
     max_positions = min(3, len(signaled_sorted))
     top_assets = signaled_sorted[:max_positions]
-
-    # 若只有1个，就给它全部组合风险；多个则平均分配组合风险
     per_position_risk_pct = portfolio_risk_pct / max_positions
 else:
     top_assets = []
     per_position_risk_pct = 0.0
 
-# 用组合风险重算“建议币数”（比刚才单品种固定风险更贴近组合管理）
+# 用组合风险重算“组合建议仓位”
 for r in rows:
     if r in top_assets and r["side"] in ["long", "short"]:
-        # 组合位置：使用组合风险；其余保持0仓
         entry = r["entry"]
         sl = r["sl"]
         qty, notion = position_sizing(
@@ -642,10 +694,12 @@ for r in rows:
         r["portfolio_qty"] = 0.0
         r["portfolio_notional"] = 0.0
 
-# === 展示：跨品种概览 ===
+# === 展示：跨品种多周期概览 ===
 display_rows = []
 for r in rows:
     side_zh = {"long": "做多", "short": "做空", "flat": "观望"}.get(r["side"], "观望")
+    direction_en = r["side"] if r["side"] in ["long", "short"] else "flat"
+
     regime_zh = {
         "trend": "趋势市",
         "squeeze": "压缩待爆发",
@@ -663,18 +717,27 @@ for r in rows:
         win_str = avg_r_str = dd_str = ""
         total_trades = 0
 
+    micro_zh = {
+        "up": "15m 上涨",
+        "down": "15m 下跌",
+        "neutral": "15m 中性",
+        "unknown": "15m 未知",
+    }.get(r["micro_trend_dir"], "15m 未知")
+
     display_rows.append(
         {
             "品种": r["inst"],
             "最新价格": f"{r['price']:.2f}",
-            "市场状态": regime_zh,
-            "当前信号": side_zh,
+            "市场状态(1H)": regime_zh,
+            "多空方向": side_zh,
+            "Direction_EN": direction_en,   # 明确: long / short / flat
             "信号类型": {
                 "breakout_trend": "趋势突破",
                 "mean_reversion": "均值回归",
                 "none": "无",
             }.get(r["signal_type"], "无"),
-            "信号说明": r["reason"],
+            "15m 微观趋势": micro_zh,
+            "信号质量(0-100)": f"{r['signal_quality']:.1f}",
             "资产历史评分(0-100)": f"{r['asset_score']:.1f}",
             "历史交易数": total_trades,
             "历史胜率": win_str,
@@ -686,41 +749,37 @@ for r in rows:
             "组合名义价值USDT": f"{r['portfolio_notional']:.2f}"
             if r["portfolio_notional"] > 0
             else "",
-            "信号优先级": r["signal_priority"],
         }
     )
 
 summary_df = pd.DataFrame(display_rows).sort_values(
-    ["信号优先级", "资产历史评分(0-100)"], ascending=False
+    "信号质量(0-100)", ascending=False
 )
 st.dataframe(summary_df, use_container_width=True)
 
 st.markdown(
     """
-**如何解读这张表：**
+**解读要点：**
 
-- **资产历史评分(0–100)**：综合过去一段时间的胜率、平均R、最大回撤、最近20笔表现；
-- **信号优先级**：趋势突破 > 均值回归 > 无信号；
-- **组合建议币数**：已经考虑了 *组合层面风险上限*，例如你把组合总风险定在 2%，
-  而有 2 个币入选组合，则每个币约 1% 风险；
-- 实战的时候，你可以优先关注：
-  - 资产评分高
-  - 当前有信号
-  - 信号优先级高  
-  的那 1~3 个币种。
+- `多空方向`：中文语义；  
+- `Direction_EN`：明确给出 `long / short / flat`，方便程序化对接；  
+- `信号质量(0-100)` =
+  - 策略类型（趋势突破 > 均值回归）；  
+  - 该币在本策略下的历史表现（资产评分）；  
+  - 15m 与 1H 的多周期共振（同向加分，反向减分）；  
+- `组合建议币数`：已经考虑组合总风险上限（例如 2%），只把风险分配给**质量最高的前 1–3 个信号**。
 """
 )
 
+# ============ 二、单一标的：策略拆分 + 回测细节 ============
 
-# ============ 二、单一标的：策略分解 + 回测细节 ============
-
-st.subheader("二、单一标的策略拆分表现（趋势突破 vs 均值回归）")
+st.subheader("二、单一标的拆解：趋势 vs 均值回归 + 资金曲线")
 
 inst_options = [r["inst"] for r in rows]
 chosen_inst = st.selectbox("选择查看详细回测的标的", options=inst_options)
 
 chosen = next(r for r in rows if r["inst"] == chosen_inst)
-df_chosen = chosen["df"]
+df_chosen = chosen["df_1h"]
 signals_chosen = chosen["signals_df"]
 trades_chosen = chosen["trades_df"]
 equity_chosen = chosen["equity_curve"]
@@ -740,7 +799,6 @@ else:
 
 st.markdown("**按策略类型拆分表现：**")
 if not stats_type.empty:
-    # 显示成更友好的中文
     mapping = {
         "breakout_trend": "趋势突破",
         "mean_reversion": "均值回归",
@@ -782,12 +840,11 @@ if not trades_chosen.empty:
 else:
     st.info("暂无交易记录，无法绘制盈亏分布。")
 
+# ============ 三、1H 风格剖面 ============
 
-# ============ 三、风格剖面：这个币擅长什么行情？ ============
+st.subheader("三、1H 风格剖面：趋势 / 压缩 / 震荡 占比")
 
-st.subheader("三、风格剖面：趋势 / 压缩 / 震荡 占比")
-
-regime_counts = chosen["df"]["regime"].value_counts(normalize=True)
+regime_counts = chosen["df_1h"]["regime"].value_counts(normalize=True)
 for regime in ["trend", "squeeze", "mean_reversion", "unknown"]:
     if regime not in regime_counts:
         regime_counts[regime] = 0.0
@@ -808,41 +865,40 @@ style_df = pd.DataFrame(
 )
 st.dataframe(style_df, use_container_width=True)
 
-latest_row = chosen["df"].iloc[-1]
+latest_row = chosen["df_1h"].iloc[-1]
 st.markdown(
     f"""
-**当前K线的风格因子：**
+**当前1H K线的关键因子：**
 
 - 趋势强度 trend_strength：{latest_row['trend_strength']:.2f}  
 - 布林带宽度 bb_width：{latest_row['bb_width']:.4f}  
 - RSI(14)：{latest_row['rsi']:.1f}  
 - ATR(14)：{latest_row['atr']:.2f}  
-- 当前市场状态：**{regime_zh_map.get(latest_row['regime'], '待定')}**
+- 当前1H市场状态：**{regime_zh_map.get(latest_row['regime'], '待定')}**
 """
 )
 
 st.markdown(
     """
-从专业角度看：
+从交易风格角度来说：
 
-- 这个币若“趋势市占比”长期偏高，说明它更适合趋势突破策略；
-- 若“震荡均值回归”占比较高，均值回归策略贡献可能更大；
-- 你也可以据此做 **“择币”**：  
-  把擅长趋势的币放在趋势组合，把适合震荡的币放在套利/盘整组合，而不是一套打法打遍所有标的。
+- 趋势市占比较高 + 趋势突破策略表现好 → 这个币适合“顺势波段”；  
+- 震荡市占比较高 + 均值回归策略表现更优 → 适合“短线高抛低吸”；  
+- 你完全可以据此做“择币 + 择时”：  
+  - 在今日信号质量最高、且风格匹配你的策略偏好的那几个标的上集中火力。
 """
 )
-
 
 # ============ 风险提示 ============
 
 st.warning(
     """
-⚠️ 风险提示（升级版同样适用）：
+⚠️ 风险提示：
 
-- 本策略基于 1H 历史数据做统计，**历史不代表未来**；
-- 资产级评分只是在当前数据下给出的“统计信心”，不是“稳赚评级”；
-- 组合层面风险控制虽然更接近机构方法，但依然没有覆盖所有极端情况（如闪崩、插针、交易所故障等）；
-- 真正专业的做法是：先用极小资金验证一段时间，  
-  熟悉策略的节奏、回撤特征、情绪考验，再考虑逐步加大仓位。
+- 本工具只是把“多周期 + 策略拆分 + 回测 + 组合风险”做了系统化呈现，
+  并不能消灭风险，只是帮你**有意识地承担风险**；
+- `Direction_EN` / `多空方向` 只是模型信号，不是保证金催收单；
+- 真正决定收益的，是你是否能在连续亏损时依然保持纪律，
+  以及在收益上来时，是否懂得控制贪婪、分批止盈。
 """
 )
