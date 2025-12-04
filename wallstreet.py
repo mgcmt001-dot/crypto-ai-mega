@@ -2,343 +2,296 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import pandas_ta as ta
-import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime
 
 # ==========================================
-# 1. 系统配置 (System Config)
+# 1. 页面配置
 # ==========================================
 st.set_page_config(
-    page_title="Commander-zzjszz [Cloud]",
-    page_icon="🦅",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="ZEC Swing Trader (1-2 Days)",
+    page_icon="🌊",
+    layout="wide"
 )
 
-# 云端无需代理
-PROXY = None
-
-# 定义 CSS 样式（保留 V21 的完整样式，并优化了字体对比度）
+# 样式：强调波动交易的视觉
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap');
-    :root { --bg:#0e1117; --card:#161b22; --border:#30363d; --gold:#d2a656; --green:#2ea043; --red:#da3633; --text:#e6edf3; }
-    html,body,[class*="css"]{font-family:'Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);}
-    
-    /* 卡片容器 */
-    .pro-card {
-        background: var(--card); border: 1px solid var(--border); border-radius: 6px; 
-        padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-        transition: transform 0.2s;
+    .stApp { background-color: #0e1117; color: #e6edf3; }
+    .signal-card {
+        background: linear-gradient(145deg, #161b22, #0d1117);
+        border: 1px solid #30363d;
+        padding: 20px; border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
-    .pro-card:hover { border-color: var(--gold); }
-    
-    /* 头部 */
-    .pc-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #21262d; padding-bottom: 10px; margin-bottom: 12px; }
-    .pc-title { font-size: 16px; font-weight: 700; color: var(--gold); }
-    .pc-tag { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
-    
-    /* 逻辑列表 */
-    .pc-logic { font-size: 13px; color: #c9d1d9; line-height: 1.6; margin-bottom: 15px; } /* 调亮字体颜色 */
-    .pc-item { display: flex; margin-bottom: 4px; }
-    .pc-icon { color: var(--gold); margin-right: 8px; font-weight: bold; }
-    
-    /* 交易计划表格 */
-    .pc-plan { background: #0d1117; border: 1px dashed #30363d; border-radius: 4px; padding: 12px; }
-    .pp-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
-    .pp-lbl { color: #8b949e; }
-    .pp-val { font-family: 'JetBrains Mono'; font-weight: 700; }
-    
-    /* 颜色定义 */
-    .c-bull { color: var(--green); } .bg-bull { background: rgba(46,160,67,0.15); color: var(--green); border:1px solid rgba(46,160,67,0.3); }
-    .c-bear { color: var(--red); } .bg-bear { background: rgba(218,54,51,0.15); color: var(--red); border:1px solid rgba(218,54,51,0.3); }
-    .c-flat { color: #8b949e; } .bg-flat { background: rgba(139,148,158,0.1); color: #8b949e; border:1px solid #30363d; }
+    .tag-long { background: #238636; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+    .tag-short { background: #da3633; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+    .metric-val { font-size: 24px; font-weight: bold; font-family: monospace; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 华尔街深度分析引擎 (V21完整核心)
+# 2. 数据引擎 (含代理)
 # ==========================================
-class WallStreetAnalyst:
-    @staticmethod
-    def deep_scan(df, tf_name):
-        if df is None or len(df) < 60: return None
-        
-        c = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        # --- 基础指标 ---
-        price = c['close']
-        ema20 = c['EMA20']
-        ema50 = c['EMA50']
-        ma200 = c.get('MA200', np.nan)
-        atr = c['ATR']
-        rsi = c['RSI']
-        macd = c['MACD']
-        sig = c['SIGNAL']
-        vol_ma = df['vol'].mean()
-        rvol = c['vol'] / vol_ma if vol_ma > 0 else 1.0
-        
-        # --- 逻辑推导容器 ---
-        logics = []
-        score = 0 # 评分系统: >2 做多, <-2 做空
-        
-        # 1. 趋势结构 (Trend Structure)
-        if price > ema20 > ema50:
-            logics.append("多头排列：价格 > EMA20 > EMA50，买盘控盘，趋势向上。")
-            score += 2
-        elif price < ema20 < ema50:
-            logics.append("空头排列：价格 < EMA20 < EMA50，卖盘压制，趋势向下。")
-            score -= 2
-        else:
-            logics.append("均线纠缠：EMA短期均线粘合，市场处于震荡蓄势阶段。")
+class BinanceData:
+    def __init__(self, proxy_url=None):
+        config = {
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'},
+            'timeout': 30000
+        }
+        if proxy_url:
+            config['proxies'] = {'http': proxy_url, 'https': proxy_url}
             
-        # 2. 动能分析 (Momentum)
-        if rsi > 70:
-            logics.append(f"RSI超买 ({rsi:.0f})：买力过度消耗，警惕回调风险。")
-            score -= 1 # 逆向思维
-        elif rsi < 30:
-            logics.append(f"RSI超卖 ({rsi:.0f})：卖力过度消耗，存在反弹需求。")
-            score += 1
-            
-        if macd > sig and c['HIST'] > 0:
-            if c['HIST'] > prev['HIST']:
-                logics.append("MACD增强：多头动能正在持续放大。")
-                score += 1
-        elif macd < sig and c['HIST'] < 0:
-             if c['HIST'] < prev['HIST']:
-                logics.append("MACD增强：空头动能正在持续放大。")
-                score -= 1
-                
-        # 3. 量价行为 (Price Action & Volume)
-        body = abs(c['close'] - c['open'])
-        lower_wick = min(c['close'], c['open']) - c['low']
-        upper_wick = c['high'] - max(c['close'], c['open'])
-        
-        if rvol > 1.5:
-            term = "放量" if c['close'] > c['open'] else "放量抛压"
-            logics.append(f"资金异动：成交量放大 {rvol:.1f}倍 ({term})，机构介入。")
-            score += 1 if c['close'] > c['open'] else -1
-            
-        if lower_wick > body * 2:
-            logics.append("金针探底：长下影线显示低位有强力承接。")
-            score += 1
-        if upper_wick > body * 2:
-            logics.append("墓碑线：长上影线显示高位抛压沉重。")
-            score -= 1
+        self.exchange = ccxt.binance(config)
+        self.proxy = proxy_url
 
-        # --- 策略生成 ---
-        action = "观望 (WAIT)"
-        bias_text = "震荡整理"
-        css_class = "bg-flat"
-        entry, sl, tp = 0, 0, 0
+    def fetch_data(self, symbol="ZEC/USDT", timeframe="4h", limit=150):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df, None
+        except Exception as e:
+            return pd.DataFrame(), str(e)
+
+# ==========================================
+# 3. 波段策略核心 (Swing Strategy)
+# ==========================================
+class SwingStrategy:
+    def __init__(self, df):
+        self.df = df
+
+    def process_indicators(self):
+        if self.df.empty: return self.df
         
-        risk_unit = atr * 1.5 if not np.isnan(atr) else price * 0.02
+        # 1. 布林带 (Bollinger Bands, 20, 2) - 核心波动区间
+        bb = ta.bbands(self.df['close'], length=20, std=2)
+        self.df = pd.concat([self.df, bb], axis=1)
+        # 列名通常为: BBL_20_2.0 (下), BBM_20_2.0 (中), BBU_20_2.0 (上)
         
-        if score >= 3: # 严格门槛
-            action = "做多 (LONG)"
-            bias_text = "强烈看涨"
-            css_class = "bg-bull"
-            entry = price
-            sl = price - risk_unit
-            # 智能止损优化
-            if not np.isnan(ma200) and price > ma200 and (price - ma200) < risk_unit:
-                sl = ma200 * 0.995
-            tp = price + risk_unit * 2
+        # 2. KDJ (随机指标) - 敏感买卖点
+        # pandas_ta 默认 KDJ: length=9, signal=3
+        kdj = ta.kdj(self.df['high'], self.df['low'], self.df['close'])
+        self.df = pd.concat([self.df, kdj], axis=1)
+        # 列名: K_9_3, D_9_3, J_9_3
+        
+        # 3. ATR - 止损计算
+        self.df['ATR'] = ta.atr(self.df['high'], self.df['low'], self.df['close'], length=14)
+        
+        return self.df.dropna()
+
+    def analyze_signal(self):
+        curr = self.df.iloc[-1]
+        prev = self.df.iloc[-2]
+        
+        price = curr['close']
+        bbu = curr['BBU_20_2.0']
+        bbl = curr['BBL_20_2.0']
+        bbm = curr['BBM_20_2.0'] # 中轨 (MA20)
+        
+        k_val = curr['K_9_3']
+        d_val = curr['D_9_3']
+        
+        score = 0
+        reasons = []
+        
+        # --- 逻辑 A: 布林带位置 ---
+        # 价格接近下轨 -> 偏多; 接近上轨 -> 偏空
+        bb_pos = (price - bbl) / (bbu - bbl) # 0=下轨, 1=上轨
+        
+        if bb_pos < 0.1:
+            score += 2
+            reasons.append("📉 价格触及布林带下轨 (超卖区域)，有反弹需求")
+        elif bb_pos > 0.9:
+            score -= 2
+            reasons.append("📈 价格触及布林带上轨 (超买区域)，有回调压力")
+        elif bb_pos < 0.4:
+            score += 0.5
+            reasons.append("🔹 价格运行在布林带下半区，偏弱但有支撑")
+        elif bb_pos > 0.6:
+            score -= 0.5
+            reasons.append("🔸 价格运行在布林带上半区，偏强但有阻力")
             
-        elif score <= -3:
-            action = "做空 (SHORT)"
-            bias_text = "强烈看跌"
-            css_class = "bg-bear"
-            entry = price
-            sl = price + risk_unit
-            if not np.isnan(ma200) and price < ma200 and (ma200 - price) < risk_unit:
-                sl = ma200 * 1.005
-            tp = price - risk_unit * 2
+        # --- 逻辑 B: KDJ 交叉 (核心触发器) ---
+        # 金叉：K线上穿D线
+        kdj_gold = (prev['K_9_3'] < prev['D_9_3']) and (curr['K_9_3'] > curr['D_9_3'])
+        kdj_dead = (prev['K_9_3'] > prev['D_9_3']) and (curr['K_9_3'] < curr['D_9_3'])
+        
+        if kdj_gold and k_val < 40:
+            score += 1.5
+            reasons.append("⚡ KDJ 低位金叉：短期动能转强信号")
+        elif kdj_dead and k_val > 60:
+            score -= 1.5
+            reasons.append("⚡ KDJ 高位死叉：短期动能衰竭信号")
+            
+        # --- 综合判定 ---
+        direction = "观望 (Neutral)"
+        signal_type = "neutral"
+        
+        if score >= 2.5:
+            direction = "波段做多 (LONG SWING)"
+            signal_type = "long"
+        elif score <= -2.5:
+            direction = "波段做空 (SHORT SWING)"
+            signal_type = "short"
+        elif score > 0:
+            direction = "震荡偏多 (Weak Bull)"
+        elif score < 0:
+            direction = "震荡偏空 (Weak Bear)"
             
         return {
-            "tf": tf_name,
-            "bias": bias_text,
-            "css": css_class,
-            "logics": logics,
-            "action": action,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "score": score
+            "direction": direction,
+            "type": signal_type,
+            "score": score,
+            "reasons": reasons,
+            "price": price,
+            "atr": curr['ATR'],
+            "bb_upper": bbu,
+            "bb_lower": bbl,
+            "bb_mid": bbm
         }
 
 # ==========================================
-# 3. 稳健数据层 (Data Engine - OKX Mod)
-# ==========================================
-class MarketDataEngine:
-    def __init__(self):
-        # 关键修改：切换到 OKX，移除 Proxy
-        config = {
-            'timeout': 30000, 
-            'enableRateLimit': True
-        }
-        self.ex = ccxt.okx(config)
-    
-    def fetch(self, symbol, tf):
-        try:
-            # 抓取足够数据以确保指标稳定
-            bars = self.ex.fetch_ohlcv(symbol, timeframe=tf, limit=300)
-            if not bars: return None
-            df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-            df['time'] = pd.to_datetime(df['time'], unit='ms')
-            
-            # 计算指标
-            df['EMA20'] = ta.ema(df['close'], length=20)
-            df['EMA50'] = ta.ema(df['close'], length=50)
-            df['MA200'] = ta.sma(df['close'], length=200)
-            df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-            df['RSI'] = ta.rsi(df['close'], length=14)
-            macd = ta.macd(df['close'])
-            if macd is not None:
-                df['MACD'] = macd.iloc[:, 0]
-                df['SIGNAL'] = macd.iloc[:, 1]
-                df['HIST'] = macd.iloc[:, 2]
-            return df
-        except: return None
-
-    def get_all(self, symbol):
-        d = {}
-        # 云端优化：改为顺序执行，防止 Cloud CPU 资源耗尽导致 Timeout
-        d['1m'] = self.fetch(symbol, '1m')
-        d['15m'] = self.fetch(symbol, '15m')
-        d['1h'] = self.fetch(symbol, '1h')
-        d['1d'] = self.fetch(symbol, '1d')
-        try:
-            d['ticker'] = self.ex.fetch_ticker(symbol)
-        except:
-            d['ticker'] = None
-        return d
-
-# ==========================================
-# 4. 安全渲染层 (V21 拼接逻辑)
-# ==========================================
-def build_card_html(res):
-    if not res: return "<div style='color:red'>数据不足</div>"
-    
-    # 1. 构建逻辑列表
-    logic_items = ""
-    for lg in res['logics']:
-        logic_items += f"<div class='pc-item'><span class='pc-icon'>•</span><span>{lg}</span></div>"
-    
-    # 2. 构建交易计划
-    plan_html = ""
-    if "观望" in res['action']:
-        plan_html = "<div class='pc-plan' style='text-align:center; color:#666;'><div>⚖️ 市场震荡中</div><div style='font-size:12px'>建议空仓等待方向明确</div></div>"
-    else:
-        c_val = "#2ea043" if "多" in res['action'] else "#da3633"
-        # 逐行构建
-        p_rows = ""
-        p_rows += f"<div class='pp-row'><span class='pp-lbl'>操作建议</span><span class='pp-val' style='color:{c_val}'>{res['action']}</span></div>"
-        p_rows += f"<div class='pp-row'><span class='pp-lbl'>建议入场</span><span class='pp-val'>${res['entry']:,.2f}</span></div>"
-        p_rows += f"<div class='pp-row'><span class='pp-lbl'>止损位</span><span class='pp-val' style='color:#da3633'>${res['sl']:,.2f}</span></div>"
-        p_rows += f"<div class='pp-row'><span class='pp-lbl'>目标位</span><span class='pp-val' style='color:#2ea043'>${res['tp']:,.2f}</span></div>"
-        plan_html = f"<div class='pc-plan' style='border-color:{c_val}40'>{p_rows}</div>"
-
-    # 3. 组合最终 HTML
-    html = f"<div class='pro-card'><div class='pc-header'><span class='pc-title'>{res['tf']}</span><span class='pc-tag {res['css']}'>{res['bias']}</span></div><div class='pc-logic'>{logic_items}</div>{plan_html}</div>"
-    
-    return html
-
-# ==========================================
-# 5. 主程序 (Main)
+# 4. 主程序
 # ==========================================
 def main():
+    # --- 侧边栏 ---
     with st.sidebar:
-        st.title("COMMANDER-@ZZ-JS-ZZ")
-        st.caption("华尔街深度策略版 [仅供参考]")
+        st.header("📡 设置")
+        use_proxy = st.checkbox("启用代理", value=True)
+        proxy_url = st.text_input("代理地址", "http://127.0.0.1:7890")
         
-        # OKX 的代码通用，通常也是 BTC/USDT 这种格式
-        coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'ZEC/USDT', 'DASH/USDT', 'DOGE/USDT', 'XRP/USDT', 'PEPE/USDT', 'ORDI/USDT']
-        sel_coin = st.selectbox("选择标的", coins)
+        st.divider()
+        st.subheader("策略周期")
+        # 1-2天波段通常看 4H K线最准
+        tf = st.selectbox("分析周期", ["1h", "4h"], index=1, help="1h适合日内，4h适合1-2天波段")
         
-        if st.button("⚡ 立即分析市场", use_container_width=True):
+        if st.button("执行分析", type="primary"):
             st.rerun()
-            
-        st.markdown("---")
-        st.info("策略模型：\n1. 趋势共振 (Trend)\n2. 动能衰竭/增强 (Momentum)\n3. 机构量能 (VPA)\n4. 智能止损 (Smart SL)")
 
-    eng = MarketDataEngine()
-    
-    with st.spinner(f"正在从 OKX 获取全周期数据: {sel_coin} ..."):
-        data = eng.get_all(sel_coin)
+    st.title("🌊 ZEC 波段猎手 (Swing Hunter)")
+    st.caption(f"目标: 捕捉 {tf} 级别波动 | 策略: 布林带均值回归 + KDJ 动能")
+
+    # --- 获取数据 ---
+    api = BinanceData(proxy_url if use_proxy else None)
+    with st.spinner("正在连接市场..."):
+        raw_df, err = api.fetch_data("ZEC/USDT", tf, limit=100)
         
-    if not data or not data.get('ticker'):
-        st.error("网络连接失败，OKX 接口响应超时。")
-        st.stop()
+    if err:
+        st.error(f"数据连接失败: {err}")
+        return
+    if raw_df.empty:
+        st.warning("未获取到数据，请检查代理。")
+        return
+
+    # --- 运行策略 ---
+    strategy = SwingStrategy(raw_df)
+    df = strategy.process_indicators()
+    res = strategy.analyze_signal()
+    
+    # --- 计算波段止盈止损 ---
+    # 波段交易止损：通常放在布林带轨道外侧一点 + 1倍ATR
+    # 止盈：第一目标是中轨(回归)，第二目标是另一侧轨道
+    
+    atr = res['atr']
+    price = res['price']
+    
+    if res['type'] == 'long':
+        sl = price - (1.5 * atr) # 稍微宽一点防震荡
+        tp1 = res['bb_mid'] # 中轨回归
+        tp2 = res['bb_upper'] # 趋势延续
+    elif res['type'] == 'short':
+        sl = price + (1.5 * atr)
+        tp1 = res['bb_mid']
+        tp2 = res['bb_lower']
+    else:
+        # 震荡中，假设做多给出参考
+        sl = price - (1.5 * atr)
+        tp1 = res['bb_mid']
+        tp2 = res['bb_upper']
+
+    # --- UI 展示 ---
+    
+    # 1. 信号卡片
+    col1, col2 = st.columns([3, 2])
+    
+    with col1:
+        color = "#8b949e"
+        if res['type'] == 'long': color = "#3fb950"
+        elif res['type'] == 'short': color = "#f85149"
         
-    # --- 顶部行情 ---
-    tick = data['ticker']
-    p_color = "#2ea043" if tick['percentage'] >= 0 else "#da3633"
-    # 使用列表拼接
-    head_parts = []
-    head_parts.append("<div style='background:#161b22; border:1px solid #d2a656; padding:15px; border-radius:6px; margin-bottom:20px; display:flex; justify-content:space-between; align-items:center;'>")
-    head_parts.append(f"<div><div style='color:#d2a656; font-weight:bold; font-size:18px;'>{sel_coin} 深度研报</div><div style='color:#8b949e; font-size:12px;'>报告时间: {datetime.now().strftime('%H:%M:%S')}</div></div>")
-    head_parts.append(f"<div style='text-align:right'><div style='font-size:28px; font-weight:bold; color:#e6edf3'>${tick['last']:,.2f}</div><div style='color:{p_color}; font-weight:bold'>{tick['percentage']:.2f}%</div></div>")
-    head_parts.append("</div>")
-    st.markdown("".join(head_parts), unsafe_allow_html=True)
-    
-    # --- 分析卡片 ---
-    c1, c2 = st.columns(2)
-    
-    # 计算逻辑
-    r_1m = WallStreetAnalyst.deep_scan(data['1m'], "超短线 (1 Min)")
-    r_15m = WallStreetAnalyst.deep_scan(data['15m'], "日内 (15 Min)")
-    r_1h = WallStreetAnalyst.deep_scan(data['1h'], "波段 (1 Hour)")
-    r_1d = WallStreetAnalyst.deep_scan(data['1d'], "趋势 (1 Day)")
-    
-    # 渲染
-    with c1:
-        st.markdown("#### ⚡ 短线博弈")
-        st.markdown(build_card_html(r_1m), unsafe_allow_html=True)
-        st.markdown(build_card_html(r_15m), unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="signal-card" style="border-left: 5px solid {color};">
+            <div style="color:#8b949e; font-size:14px;">当前策略建议</div>
+            <div style="font-size:32px; font-weight:bold; color:{color}; margin: 10px 0;">{res['direction']}</div>
+            <div style="font-size:16px;">现价: <b>${price:.2f}</b></div>
+        </div>
+        """, unsafe_allow_html=True)
         
-    with c2:
-        st.markdown("#### 🌊 趋势布局")
-        st.markdown(build_card_html(r_1h), unsafe_allow_html=True)
-        st.markdown(build_card_html(r_1d), unsafe_allow_html=True)
-        
-    # --- 最终建议 ---
-    total_score = 0
-    if r_15m: total_score += r_15m['score']
-    if r_1h: total_score += r_1h['score'] * 1.5 # 1小时权重更高
-    if r_1d: total_score += r_1d['score'] * 2.0 # 日线权重最高
+    with col2:
+        st.markdown("""<div style="height:10px"></div>""", unsafe_allow_html=True)
+        st.info(f"📊 波动率 (ATR): {atr:.2f}")
+        st.caption("ATR 越高，建议仓位越小")
+
+    # 2. 交易计划 (表格化)
+    st.subheader("🎯 波段交易计划 (1-2天)")
     
-    final_text = "市场混沌，建议观望"
-    f_bg = "#8b949e"
+    plan_cols = st.columns(3)
+    plan_cols[0].metric("🛑 止损 (SL)", f"${sl:.2f}", delta="-1.5 ATR风险", delta_color="inverse")
+    plan_cols[1].metric("💰 目标一 (TP1)", f"${tp1:.2f}", "均值回归(中轨)")
+    plan_cols[2].metric("🚀 目标二 (TP2)", f"${tp2:.2f}", "波段极值(对侧轨)")
+
+    with st.expander("查看决策依据"):
+        for r in res['reasons']:
+            st.write(r)
+
+    # 3. 布林带+KDJ 图表
+    st.subheader("📈 市场波动结构")
     
-    if total_score >= 4:
-        final_text = "💎 极强多头共振 (全仓做多信号)"
-        f_bg = "#2ea043"
-    elif total_score >= 2:
-        final_text = "📈 震荡偏多 (逢低做多)"
-        f_bg = "#2ea043"
-    elif total_score <= -4:
-        final_text = "⚠️ 极强空头共振 (清仓/做空信号)"
-        f_bg = "#da3633"
-    elif total_score <= -2:
-        final_text = "📉 震荡偏空 (逢高做空)"
-        f_bg = "#da3633"
-        
-    sum_html = f"<div style='background:{f_bg}20; border:1px solid {f_bg}; padding:20px; border-radius:6px; text-align:center; margin-top:20px;'><div style='color:{f_bg}; font-weight:bold; font-size:14px;'>首席分析师最终裁决</div><div style='color:#e6edf3; font-size:24px; font-weight:bold; margin:10px 0;'>{final_text}</div><div style='color:#8b949e; font-size:13px'>综合评分: {total_score:.1f} (评分>4为极强信号)</div></div>"
-    st.markdown(sum_html, unsafe_allow_html=True)
+    # 上图：K线 + 布林带
+    fig = go.Figure()
     
-    # --- 图表 ---
-    with st.expander("📊 查看 1小时 K线深度图 (Price Action)", expanded=True):
-        if data['1h'] is not None:
-            df = data['1h']
-            fig = go.Figure(data=[go.Candlestick(x=df['time'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-                                increasing_line_color='#2ea043', decreasing_line_color='#da3633')])
-            fig.update_layout(template='plotly_dark', margin=dict(l=0,r=0,t=0,b=0), height=400, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-            st.plotly_chart(fig, use_container_width=True)
+    # 布林带区域 (填充)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['BBU_20_2.0'],
+        line=dict(width=0), showlegend=False, hoverinfo='skip'
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['BBL_20_2.0'],
+        fill='tonexty', fillcolor='rgba(255, 255, 255, 0.05)',
+        line=dict(width=0), showlegend=False, hoverinfo='skip',
+        name='Bollinger Band'
+    ))
+    
+    # K线
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+        name='Price'
+    ))
+    
+    # 中轨
+    fig.add_trace(go.Scatter(x=df.index, y=df['BBM_20_2.0'], line=dict(color='orange', width=1), name='BB Mid'))
+    
+    # 止盈止损参考线
+    if res['type'] != 'neutral':
+        fig.add_hline(y=tp1, line_dash="dot", line_color="green", annotation_text="TP1")
+        fig.add_hline(y=sl, line_dash="dot", line_color="red", annotation_text="SL")
+
+    fig.update_layout(
+        template='plotly_dark', height=500, margin=dict(l=0,r=0,t=0,b=0),
+        xaxis_rangeslider_visible=False,
+        plot_bgcolor='#0d1117', paper_bgcolor='#0d1117'
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 提示
+    st.markdown("""
+    > **波段交易心法**：
+    > 1. **不做中间段**：尽量在价格触及布林带上下轨时才出手。
+    > 2. **时间止损**：如果开仓后 24小时 价格还在原地不动，说明波动逻辑失效，建议平仓离场。
+    > 3. **盈亏比**：ZEC 波动大，如果 TP1 距离太近（盈亏比<1:1），这笔交易不值得做。
+    """)
 
 if __name__ == "__main__":
     main()
-
-
